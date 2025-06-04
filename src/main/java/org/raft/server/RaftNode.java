@@ -1,6 +1,8 @@
 package org.raft.server;
 
+import org.raft.kvstore.rpc.ClientRequest;
 import org.raft.kvstore.rpc.ClientResponse;
+import org.raft.kvstore.rpc.RequestLogReply;
 import org.raft.raft.rpc.*;
 
 import java.util.*;
@@ -26,6 +28,7 @@ public class RaftNode {
     private volatile NodeState currentState = NodeState.FOLLOWER;
     private AtomicLong commitIndex = new AtomicLong(0);
     private AtomicLong lastApplied = new AtomicLong(0);
+    private AtomicLong currElectionTimeOut = new AtomicLong(0);
     private String currentLeaderId = null;
 
     // State Machine (Key-Value Store)
@@ -37,7 +40,7 @@ public class RaftNode {
     private ScheduledFuture<?> heartbeatTask;
     private final Random random = new Random();
     private static final int ELECTION_TIMEOUT_MIN = 250;
-    private static final int ELECTION_TIMEOUT_MAX = 400;
+    private static final int ELECTION_TIMEOUT_MAX = 1000;
     private static final int HEARTBEAT_INTERVAL_MS = 100;
 
     // client request map
@@ -146,6 +149,7 @@ public class RaftNode {
         }
         if (currentState == NodeState.FOLLOWER || currentState == NodeState.CANDIDATE) {
             long timeout = ELECTION_TIMEOUT_MIN + random.nextInt(ELECTION_TIMEOUT_MAX - ELECTION_TIMEOUT_MIN);
+            currElectionTimeOut.set(timeout);
             electionTimeoutTask = scheduler.schedule(this::handleElectionTimeout, timeout, TimeUnit.MILLISECONDS);
         }
     }
@@ -193,7 +197,7 @@ public class RaftNode {
                     if (currentState != NodeState.CANDIDATE || currentTerm.get() != term) {
                         return;
                     }
-                    RequestVoteReply reply = peer.getBlockingStub().withDeadlineAfter(5000, TimeUnit.MILLISECONDS).requestVote(request);
+                    RequestVoteReply reply = peer.getBlockingStub().withDeadlineAfter(currElectionTimeOut.get(), TimeUnit.MILLISECONDS).requestVote(request);
                     synchronized (RaftNode.this) {
                         if (reply.getTerm() > currentTerm.get()) {
                             becomeFollower(reply.getTerm());
@@ -358,8 +362,8 @@ public class RaftNode {
 
         // delete wrong entries
         int startIdx = 0;
-        for (int i = (int)args.getPrevLogIndex() + 1; i < log.size(); i++) {
-            if (log.get(i).getTerm() != args.getEntries(i - ((int)args.getPrevLogIndex() + 1)).getTerm()) {
+        for (int i = (int) args.getPrevLogIndex() + 1; i < log.size(); i++) {
+            if (log.get(i).getTerm() != args.getEntries(i - ((int) args.getPrevLogIndex() + 1)).getTerm()) {
                 while (i < log.size()) {
                     log.remove(i);
                     i++;
@@ -432,8 +436,8 @@ public class RaftNode {
                 break;
             }
             LogEntry currLog = log.get((int) applyIdx);
-            // TODO: divide between apply command and change membership
-            applyCommand(currLog.getCommand());
+            String res = applyCommand(currLog.getCommand());
+            completeClientFuture(applyIdx, res, true);
         }
     }
 
@@ -479,21 +483,106 @@ public class RaftNode {
     }
 
     /* CLIENT REQUEST HANDLING */
-//    public ClientResponse handleClientExecute(ClientRequest request) {
-//        final ClientRequest.CommandType type = request.getType();
-//        final String key = request.getKey();
-//        final String value = request.getValue();
-//
-//        CompletableFuture<ClientResponse> responseFuture = new CompletableFuture<>();
-//        synchronized (this) {
-//            if (currentState != NodeState.LEADER) {
-//                String leaderAddr = getPeerAddress(getCurrentLeaderId());
-//                ClientResponse redirectResponse = ClientResponse.newBuilder()
-//                        .setSuccess(false)
-//
-//            }
-//        }
-//    }
+    public ClientResponse handleClientExecute(ClientRequest request) {
+        logger.info("handleClientExecute");
+        final ClientRequest.CommandType type = request.getType();
+        final String key = request.getKey();
+        final String value = request.getValue();
+        final String cmd = type.name();
+
+        CompletableFuture<ClientResponse> responseFuture = new CompletableFuture<>();
+        long tmp = 0;
+        synchronized (this) {
+            if (currentState != NodeState.LEADER) {
+                String leaderAddr = getPeerAddress(getCurrentLeaderId());
+                ClientResponse redirectResponse = ClientResponse.newBuilder()
+                        .setSuccess(false)
+                        .setLeaderAddress(!leaderAddr.isEmpty() ? leaderAddr : "")
+                        .build();
+                responseFuture.complete(redirectResponse);
+                logger.warning("This node is not a leader");
+                return redirectResponse;
+            }
+
+            // if ping just response
+            if (type == ClientRequest.CommandType.PING) {
+                String leaderAddr = getPeerAddress(getCurrentLeaderId());
+                String res = applyCommand("PING");
+                ClientResponse pongResponse = ClientResponse.newBuilder()
+                        .setSuccess(true)
+                        .setLeaderAddress(!leaderAddr.isEmpty() ? leaderAddr : "")
+                        .setResult(res)
+                        .build();
+                responseFuture.complete(pongResponse);
+                logger.info("This is ping");
+                return pongResponse;
+            } else if (type == ClientRequest.CommandType.GET || type == ClientRequest.CommandType.STRLEN) {
+                String leaderAddr = getPeerAddress(getCurrentLeaderId());
+                String res = applyCommand(cmd + " " + key);
+                ClientResponse getResponse = ClientResponse.newBuilder()
+                        .setSuccess(true)
+                        .setLeaderAddress(!leaderAddr.isEmpty() ? leaderAddr : "")
+                        .setResult(res)
+                        .build();
+                responseFuture.complete(getResponse);
+                logger.info("This is get");
+                return getResponse;
+            } else {
+                StringBuilder command = new StringBuilder(cmd);
+                if (!key.isEmpty()) {
+                    command.append(" ").append(key);
+                }
+                if (!value.isEmpty()) {
+                    command.append(" ").append(value);
+                }
+                LogEntry newEntry = LogEntry.newBuilder()
+                        .setTerm(currentTerm.get())
+                        .setCommand(command.toString())
+                        .build();
+                log.add(newEntry);
+                long entryIndex = log.size() - 1;
+                tmp = entryIndex;
+                clientRequestFutures.put(entryIndex, responseFuture);
+                sendAppendEntries(false);
+                updateCommitIndex();
+            }
+        }
+
+        try {
+            return responseFuture.get(10, TimeUnit.SECONDS);
+        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+            clientRequestFutures.remove(tmp);
+            return ClientResponse.newBuilder().setSuccess(false).setResult("ERROR: " + e.getClass().getSimpleName() + " - " + e.getMessage()).build();
+        }
+    }
+
+    public RequestLogReply handleRequestLog() {
+        synchronized (this) {
+            if (currentState != NodeState.LEADER) {
+                String leaderAddr = getPeerAddress(getCurrentLeaderId());
+                logger.info(nodeId + " (not Leader) received request log, redirecting to " + (currentLeaderId != null ? currentLeaderId : "unknown leader"));
+                return RequestLogReply.newBuilder().setSuccess(false).setLeaderAddress(!leaderAddr.isEmpty() ? leaderAddr : "").build();
+            }
+            return RequestLogReply.newBuilder()
+                    .setSuccess(true)
+                    .setLeaderAddress(getSelfAddress())
+                    .addAllLogs(new ArrayList<>(log)) // Send a copy
+                    .build();
+        }
+    }
+
+    private void completeClientFuture(long logIndex, String result, boolean success) {
+        CompletableFuture<ClientResponse> future = clientRequestFutures.remove(logIndex);
+        if (future != null) {
+            ClientResponse.Builder responseBuilder = ClientResponse.newBuilder()
+                    .setSuccess(success)
+                    .setResult(result != null ? result : "");
+            if (!success && currentLeaderId != null && !currentLeaderId.equals(nodeId)) {
+                responseBuilder.setLeaderAddress(getPeerAddress(currentLeaderId));
+            }
+            future.complete(responseBuilder.build());
+        }
+    }
 
     /* UTILITIES */
     public String getNodeId() {
@@ -535,7 +624,23 @@ public class RaftNode {
         if (electionTimeoutTask != null) electionTimeoutTask.cancel(true);
         if (heartbeatTask != null) heartbeatTask.cancel(true);
         scheduler.shutdownNow();
+        electionRpcExecutor.shutdownNow();
+        appendEntriesRpcExecutor.shutdownNow();
         peers.values().forEach(Peer::disconnect);
+        try {
+            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                logger.warning(nodeId + " scheduler did not terminate cleanly.");
+            }
+            if (!electionRpcExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                logger.warning(nodeId + " electionRpcExecutor did not terminate cleanly.");
+            }
+            if (!appendEntriesRpcExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                logger.warning(nodeId + " appendEntriesRpcExecutor did not terminate cleanly.");
+            }
+        } catch (InterruptedException e) {
+            logger.warning(nodeId + " shutdown interrupted.");
+            Thread.currentThread().interrupt();
+        }
         logger.info(nodeId + " scheduler and peer connections shut down.");
     }
 }

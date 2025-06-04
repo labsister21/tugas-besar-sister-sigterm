@@ -33,8 +33,8 @@ message RequestLogArgs {}
 
 message RequestLogReply {
   repeated raft.LogEntry logs = 1;
-  string leader_id = 2;
-  bool success = 3;
+  bool success = 2;
+  string leaderAddress = 3;
 }
 
 service KVStoreService {
