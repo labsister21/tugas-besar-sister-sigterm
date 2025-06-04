@@ -1,0 +1,74 @@
+version: '3.9'
+
+networks:
+  raftnet:
+    driver: bridge
+
+services:
+  node1:
+    build: .
+    container_name: node1
+    command: ["java", "-cp", "app.jar", "org.raft.server.Server", "node1", "node1:5050", "node2,node2:5050", "node3,node3:5050", "node4,node4:5050"]
+    networks:
+      raftnet:
+        aliases:
+          - node1
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "5050:5050"
+
+  node2:
+    build: .
+    container_name: node2
+    command: ["java", "-cp", "app.jar", "org.raft.server.Server", "node2", "node2:5050", "node1,node1:5050", "node3,node3:5050", "node4,node4:5050"]
+    networks:
+      raftnet:
+        aliases:
+          - node2
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "5051:5050"
+
+  node3:
+    build: .
+    container_name: node3
+    command: ["java", "-cp", "app.jar", "org.raft.server.Server", "node3", "node3:5050", "node1,node1:5050", "node2,node2:5050", "node4,node4:5050"]
+    networks:
+      raftnet:
+        aliases:
+          - node3
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "5052:5050"
+
+  node4:
+    build: .
+    container_name: node4
+    command: ["java", "-cp", "app.jar", "org.raft.server.Server", "node4", "node4:5050", "node1,node1:5050", "node2,node2:5050", "node3,node3:5050"]
+    networks:
+      raftnet:
+        aliases:
+          - node4
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "5053:5050"
+
+  client:
+    build: .
+    container_name: client
+    command: ["java", "-cp", "app.jar", "org.raft.client.Client", "node1:5050"]
+    stdin_open: true
+    tty: true
+    depends_on:
+      - node1
+      - node2
+      - node3
+      - node4
+    networks:
+      raftnet:
+        aliases:
+          - client
