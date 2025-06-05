@@ -102,18 +102,18 @@ public class Client {
                             for (int i = 0; i < logReply.getLogsCount(); i++) {
                                 LogEntry entry = logReply.getLogs(i);
                                 System.out.print("  Index " + i + ": Term=" + entry.getTerm());
-                                System.out.print("  Type=" + entry.getType());
+                                System.out.print(" Type=" + entry.getType());
                                 if (entry.getKey() != null && !entry.getKey().isEmpty()) {
-                                    System.out.print("  Key=" + entry.getKey());
+                                    System.out.print(" Key=" + entry.getKey());
                                 }
                                 if (entry.getValue() != null && !entry.getValue().isEmpty()) {
-                                    System.out.print("  Value=" + entry.getValue());
+                                    System.out.print(" Value=" + entry.getValue());
                                 }
                                 if (!entry.getOldConfList().isEmpty()) {
-                                    System.out.print("  OldConfList=" + entry.getOldConfList());
+                                    System.out.print(" OldConfList=" + entry.getOldConfList());
                                 }
                                 if (!entry.getNewConfList().isEmpty()) {
-                                    System.out.print("  NewConfList=" + entry.getNewConfList());
+                                    System.out.print(" NewConfList=" + entry.getNewConfList());
                                 }
                                 System.out.println();
                             }
