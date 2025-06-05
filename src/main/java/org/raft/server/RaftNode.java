@@ -372,7 +372,7 @@ public class RaftNode {
     // send append entries to multiple peer
     private synchronized void sendAppendEntries(boolean isHeartBeat) {
         if (isHeartBeat) {
-//            logger.info(nodeId + " sends heart beats");
+            logger.info(nodeId + " sends heart beats");
         }
         for (Peer peer : peers.values()) {
             sendAppendEntries(peer, isHeartBeat);
@@ -488,58 +488,17 @@ public class RaftNode {
                                     ", PeerNextIndex now: " + peer.getNextIndex());
                             updateCommitIndex();
                         } else if (!isHeartBeat) {
-                            long currentNextIndexOnPeerObject = peer.getNextIndex();
-                            long newBackedOffNextIdx;
-
-                            if (reply.getMatchIndex() < request.getPrevLogIndex() && reply.getMatchIndex() >= 0) {
-                                newBackedOffNextIdx = reply.getMatchIndex() + 1;
-                            } else {
-                                newBackedOffNextIdx = Math.max(1, currentNextIndexOnPeerObject - 1);
-                            }
-                            newBackedOffNextIdx = Math.min(newBackedOffNextIdx, currentNextIndexOnPeerObject);
-
-
-                            logger.info(nodeId + " AE to " + peer.getNodeId() + " failed (log inconsistency). " +
-                                    "FollowerMatchHint: " + reply.getMatchIndex() +
-                                    ". Peer's current nextIndex: " + currentNextIndexOnPeerObject +
-                                    ". Backing off PeerNextIndex to " + newBackedOffNextIdx);
-
-                            peer.setNextIndex(newBackedOffNextIdx);
-
-                            logger.info(nodeId + " Scheduling retry AE (log sync) to " + peer.getNodeId() + " in " + APPEND_ENTRIES_RETRY_DELAY_MS + "ms.");
+                            long newNextIdx = Math.max(1, peer.getNextIndex() - 1);
+                            peer.setNextIndex(newNextIdx);
                             scheduler.schedule(() -> {
-                                if (RaftNode.this.currentState == NodeState.LEADER && RaftNode.this.currentTerm.get() == currentTermSnapshot) {
-                                    sendAppendEntries(peer, false);
-                                } else {
-                                    logger.info(nodeId + " Retry AE for " + peer.getNodeId() + " cancelled; state/term changed during delay.");
+                                synchronized (this) {
+                                    if (RaftNode.this.currentState == NodeState.LEADER && RaftNode.this.currentTerm.get() == currentTermSnapshot) {
+                                        sendAppendEntries(peer, false);
+                                    } else {
+                                        logger.info(nodeId + " Retry AE for " + peer.getNodeId() + " cancelled; state/term changed during delay.");
+                                    }
                                 }
                             }, APPEND_ENTRIES_RETRY_DELAY_MS, TimeUnit.MILLISECONDS);
-                        }
-                    }
-                }
-            } catch (io.grpc.StatusRuntimeException sre) {
-                logger.warning(nodeId + " gRPC Exception sending AE to " + peer.getNodeId() +
-                        " (isHeartbeat: " + isHeartBeat + ", SentPrevLogIdx: " + request.getPrevLogIndex() +
-                        ", PeerNextIndexAtSendTime: " + nextIdxToSendFromPeerObject +
-                        "). Status: " + sre.getStatus().getCode() + " - " + sre.getStatus().getDescription());
-                if (!isHeartBeat && currentState == NodeState.LEADER && currentTerm.get() == currentTermSnapshot) {
-                    synchronized (this) {
-                        if (currentState == NodeState.LEADER && currentTerm.get() == currentTermSnapshot) {
-                            long nextIdxToBackOffFrom = peer.getNextIndex();
-                            if (nextIdxToBackOffFrom == nextIdxToSendFromPeerObject && request.getPrevLogIndex() + 1 != nextIdxToSendFromPeerObject && request.getEntriesCount() > 0){
-                                nextIdxToBackOffFrom = nextIdxToSendFromPeerObject;
-                            }
-
-                            long newBackedOffNextIdx = Math.max(1, nextIdxToBackOffFrom - 1);
-                            if (newBackedOffNextIdx < peer.getNextIndex() || (peer.getNextIndex() == 1 && newBackedOffNextIdx == 1) ){
-                                peer.setNextIndex(newBackedOffNextIdx);
-                                logger.info(nodeId + " AE to " + peer.getNodeId() + " failed (gRPC exception). " +
-                                        "Backed off PeerNextIndex to " + peer.getNextIndex() +
-                                        " (was " + nextIdxToSendFromPeerObject + " at send time). Will retry on next cycle.");
-                            } else {
-                                logger.info(nodeId + " AE to " + peer.getNodeId() + " failed (gRPC exception). " +
-                                        "PeerNextIndex ("+ peer.getNextIndex() +") not backed off further. Will retry on next cycle.");
-                            }
                         }
                     }
                 }
@@ -548,24 +507,17 @@ public class RaftNode {
                         " (isHeartbeat: " + isHeartBeat + ", SentPrevLogIdx: " + request.getPrevLogIndex() +
                         ", PeerNextIndexAtSendTime: " + nextIdxToSendFromPeerObject + ")", e);
                 if (!isHeartBeat && currentState == NodeState.LEADER && currentTerm.get() == currentTermSnapshot) {
-                    synchronized (this) {
-                        if (currentState == NodeState.LEADER && currentTerm.get() == currentTermSnapshot) {
-                            long nextIdxToBackOffFrom = peer.getNextIndex();
-                            if (nextIdxToBackOffFrom == nextIdxToSendFromPeerObject && request.getPrevLogIndex() +1 != nextIdxToSendFromPeerObject && request.getEntriesCount() > 0){
-                                nextIdxToBackOffFrom = nextIdxToSendFromPeerObject;
-                            }
-                            long newBackedOffNextIdx = Math.max(1, nextIdxToBackOffFrom - 1);
-                            if (newBackedOffNextIdx < peer.getNextIndex() || (peer.getNextIndex() == 1 && newBackedOffNextIdx ==1) ){
-                                peer.setNextIndex(newBackedOffNextIdx);
-                                logger.info(nodeId + " AE to " + peer.getNodeId() + " failed (generic exception). " +
-                                        "Backed off PeerNextIndex to " + peer.getNextIndex() +
-                                        " (was " + nextIdxToSendFromPeerObject + " at send time). Will retry on next cycle.");
+                    long newNextIdx = Math.max(1, peer.getNextIndex() - 1);
+                    peer.setNextIndex(newNextIdx);
+                    scheduler.schedule(() -> {
+                        synchronized (this) {
+                            if (RaftNode.this.currentState == NodeState.LEADER && RaftNode.this.currentTerm.get() == currentTermSnapshot) {
+                                sendAppendEntries(peer, false);
                             } else {
-                                logger.info(nodeId + " AE to " + peer.getNodeId() + " failed (generic exception). " +
-                                        "PeerNextIndex ("+ peer.getNextIndex() +") not backed off further. Will retry on next cycle.");
+                                logger.info(nodeId + " Retry AE for " + peer.getNodeId() + " cancelled; state/term changed during delay.");
                             }
                         }
-                    }
+                    }, APPEND_ENTRIES_RETRY_DELAY_MS, TimeUnit.MILLISECONDS);
                 }
             }
         }, appendEntriesRpcExecutor);
@@ -610,7 +562,7 @@ public class RaftNode {
             return AppendEntriesReply.newBuilder()
                     .setTerm(currentTerm.get())
                     .setSuccess(false)
-                    .setMatchIndex(this.log.size() > 0 ? this.log.size() - 1 : 0) // Hint: my current last log index
+                    .setMatchIndex(0)
                     .build();
         }
         if (args.getPrevLogIndex() < 0) {
@@ -628,11 +580,10 @@ public class RaftNode {
                     ": Term mismatch at prevLogIndex " + args.getPrevLogIndex() +
                     ". My term: " + log.get((int) args.getPrevLogIndex()).getTerm() +
                     ", Leader's prevLogTerm: " + args.getPrevLogTerm());
-            long hintMatchIndex = Math.max(0, args.getPrevLogIndex() - 1);
             return AppendEntriesReply.newBuilder()
                     .setTerm(currentTerm.get())
                     .setSuccess(false)
-                    .setMatchIndex(hintMatchIndex)
+                    .setMatchIndex(0)
                     .build();
         }
 
