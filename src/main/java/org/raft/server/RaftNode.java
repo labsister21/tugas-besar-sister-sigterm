@@ -111,7 +111,7 @@ public class RaftNode {
         boolean wasNotFollower = currentState != NodeState.FOLLOWER;
 
         if (termIncreased || wasNotFollower) {
-            logger.info(nodeId + " becoming follower for term " + term + " (was " + currentState + ", oldTerm: " + currentTerm.get() +")");
+            logger.info(nodeId + " becoming follower for term " + term + " (was " + currentState + ", oldTerm: " + currentTerm.get() + ")");
         }
 
         if (term > currentTerm.get()) {
@@ -354,11 +354,11 @@ public class RaftNode {
 
     // send heartbeat from leader
     private void sendHeartbeats() {
-        logger.fine(nodeId + " sending heartbeats for term " + currentTerm.get());
         synchronized (this) {
             if (currentState != NodeState.LEADER) {
                 return;
             }
+            logger.fine(nodeId + " sending heartbeats for term " + currentTerm.get());
             lastLeaderCommunicationTime.set(System.currentTimeMillis());
             logger.fine(nodeId + " sending heartbeats for term " + currentTerm.get());
             sendAppendEntries(true);
@@ -379,6 +379,9 @@ public class RaftNode {
     // send append entries to a single peer
     private void sendAppendEntries(Peer peer, boolean isHeartBeat) {
 //        logger.info(nodeId + " sends append entries to " + peer.getNodeId());
+        if (!isHeartBeat) {
+            logger.info(nodeId + " send append entries to " + peer.getNodeId());
+        }
         if (currentState != NodeState.LEADER) return;
         final long nextIdx = peer.getNextIndex();
         long prevLogIdx = Math.max(0, nextIdx - 1);
@@ -408,7 +411,7 @@ public class RaftNode {
         CompletableFuture.runAsync(() -> {
             try {
                 if (currentState != NodeState.LEADER) return;
-                AppendEntriesReply reply = peer.getBlockingStub().withDeadlineAfter(ELECTION_TIMEOUT_MAX , TimeUnit.MILLISECONDS).appendEntries(request);
+                AppendEntriesReply reply = peer.getBlockingStub().withDeadlineAfter(ELECTION_TIMEOUT_MAX, TimeUnit.MILLISECONDS).appendEntries(request);
 
                 synchronized (this) {
                     if (reply.getTerm() > currentTerm.get()) {
@@ -460,11 +463,11 @@ public class RaftNode {
         currentLeaderId = args.getLeaderId();
 
         if (args.getTerm() > currentTerm.get() ||
-                (currentState == NodeState.CANDIDATE && currentTerm.get() == args.getTerm())) {
+                currentState == NodeState.CANDIDATE) {
             becomeFollower(args.getTerm());
+        } else {
+            resetElectionTimer();
         }
-
-        resetElectionTimer();
         // check log consistency
         if (args.getPrevLogIndex() >= log.size() || args.getPrevLogIndex() < 0 ||
                 log.get((int) args.getPrevLogIndex()).getTerm() != args.getPrevLogTerm()) {
@@ -523,6 +526,8 @@ public class RaftNode {
 
         if (args.getEntriesCount() == 0) {
             logger.info("Received heart beat");
+        } else {
+            logger.info("Received append entries");
         }
 
         return AppendEntriesReply.newBuilder()
@@ -585,6 +590,7 @@ public class RaftNode {
             }
             boolean isOldMajority = oldAcks >= (oldConfig.size() / 2 + 1);
             boolean isNewMajority = newAcks >= (newConfig.size() / 2 + 1);
+            logger.info(oldAcks + " " + newAcks);
             return isNewMajority && isOldMajority;
         } else {
             if (stableConfig.isEmpty()) {
@@ -861,7 +867,6 @@ public class RaftNode {
         Map<String, String> nodeMap = new HashMap<>();
         for (String raw : entry.getNodeMapList()) {
             String[] parts = raw.split("=");
-            logger.info(Arrays.toString(parts));
             String id = parts[0];
             String address = parts[1];
             nodeMap.put(id, address);
@@ -941,12 +946,9 @@ public class RaftNode {
     }
 
     private synchronized void applyCommitedNewEntry(LogEntry entry) {
-        // this function is only for leader to apply the commited new entry
-        if (currentState != NodeState.LEADER) {
-            return;
-        }
         logger.info(nodeId + " is committing c_new");
 
+        if (!inJointConsensus) return;
         Set<String> newConf = new HashSet<>(entry.getNewConfList());
         this.stableConfig = newConf;
         this.oldConfig = new HashSet<>();

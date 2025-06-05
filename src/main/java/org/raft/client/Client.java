@@ -173,7 +173,7 @@ public class Client {
                     String[] res = commandString.split(" ");
                     String cmd = res[0];
                     String key = res.length > 1 ? res[1] : null;
-                    String value = res.length > 2 ? res[2] : null;
+                    String value = res.length > 2 ? res[2] : "";
 
                     ClientRequest.Builder builder = ClientRequest.newBuilder().setType(ClientRequest.CommandType.valueOf(cmd));
                     if (key != null) {

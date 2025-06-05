@@ -57,6 +57,19 @@ services:
     ports:
       - "5053:5050"
 
+  node5:
+    build: .
+    container_name: node5
+    command: [ "java", "-cp", "app.jar", "org.raft.server.Server", "node5", "node5:5050"]
+    networks:
+      raftnet:
+        aliases:
+          - node5
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "5054:5050"
+
   client:
     build: .
     container_name: client
