@@ -7,7 +7,6 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class RaftNode {
@@ -480,51 +479,31 @@ public class RaftNode {
         }, appendEntriesRpcExecutor);
     }
 
-    // handle append entries respond
     public synchronized AppendEntriesReply handleAppendEntries(AppendEntriesArgs args) {
+        logger.fine(nodeId + " receives append entries from " + args.getLeaderId());
+        // early return for old terms
         if (args.getTerm() < currentTerm.get()) {
-            logger.warning(nodeId + " [handleAppendEntries] Rejected AE from " + args.getLeaderId() +
-                    ": Older term " + args.getTerm() + " (my term: " + currentTerm.get() + ")");
             return AppendEntriesReply.newBuilder()
                     .setTerm(currentTerm.get())
                     .setSuccess(false)
-                    .setMatchIndex(!this.log.isEmpty() ? this.log.size() - 1 : 0) // Hint: my last log index
+                    .setMatchIndex(0)
                     .build();
         }
 
+        // valid append entries received
         lastLeaderCommunicationTime.set(System.currentTimeMillis());
         currentLeaderId = args.getLeaderId();
 
-        if (args.getTerm() > currentTerm.get()) {
-            logger.info(nodeId + " [handleAppendEntries] Received AE from " + args.getLeaderId() +
-                    " with newer term " + args.getTerm() + ". Becoming follower.");
-            becomeFollower(args.getTerm());
-        } else if (currentState == NodeState.CANDIDATE && args.getTerm() == currentTerm.get()) {
-            logger.info(nodeId + " [handleAppendEntries] Candidate received AE from leader " + args.getLeaderId() +
-                    " in same term " + args.getTerm() + ". Becoming follower.");
+        if (args.getTerm() > currentTerm.get() ||
+                currentState == NodeState.CANDIDATE) {
             becomeFollower(args.getTerm());
         } else {
-            if (currentState == NodeState.LEADER && !this.nodeId.equals(args.getLeaderId())) {
-                logger.warning(nodeId + " [handleAppendEntries] Leader received AE from another leader " + args.getLeaderId() +
-                        " in same term " + args.getTerm() + ". Stepping down.");
-                becomeFollower(args.getTerm());
-            } else {
-                resetElectionTimer();
-            }
+            resetElectionTimer();
         }
 
-        if (args.getPrevLogIndex() >= log.size()) {
-            logger.warning(nodeId + " [handleAppendEntries] Rejected AE from " + args.getLeaderId() +
-                    ": prevLogIndex " + args.getPrevLogIndex() + " is out of bounds (my log size: " + log.size() + ").");
-            return AppendEntriesReply.newBuilder()
-                    .setTerm(currentTerm.get())
-                    .setSuccess(false)
-                    .setMatchIndex(0)
-                    .build();
-        }
-        if (args.getPrevLogIndex() < 0) {
-            logger.severe(nodeId + " [handleAppendEntries] Rejected AE from " + args.getLeaderId() +
-                    ": prevLogIndex " + args.getPrevLogIndex() + " is negative. This is unexpected.");
+        // check log consistency
+        if (args.getPrevLogIndex() >= log.size() || args.getPrevLogIndex() < 0 ||
+                log.get((int) args.getPrevLogIndex()).getTerm() != args.getPrevLogTerm()) {
             return AppendEntriesReply.newBuilder()
                     .setTerm(currentTerm.get())
                     .setSuccess(false)
@@ -532,104 +511,65 @@ public class RaftNode {
                     .build();
         }
 
-        if (log.get((int) args.getPrevLogIndex()).getTerm() != args.getPrevLogTerm()) {
-            logger.warning(nodeId + " [handleAppendEntries] Rejected AE from " + args.getLeaderId() +
-                    ": Term mismatch at prevLogIndex " + args.getPrevLogIndex() +
-                    ". My term: " + log.get((int) args.getPrevLogIndex()).getTerm() +
-                    ", Leader's prevLogTerm: " + args.getPrevLogTerm());
-            return AppendEntriesReply.newBuilder()
-                    .setTerm(currentTerm.get())
-                    .setSuccess(false)
-                    .setMatchIndex(0)
-                    .build();
-        }
-
+        // Find conflicts and handle log truncation
         int conflictIndex = -1;
+        int entriesStartIndex = (int) args.getPrevLogIndex() + 1;
+
         for (int i = 0; i < args.getEntriesCount(); i++) {
-            int logIndexOnFollower = (int) args.getPrevLogIndex() + 1 + i;
-            if (logIndexOnFollower < log.size()) {
-                if (log.get(logIndexOnFollower).getTerm() != args.getEntries(i).getTerm()) {
-                    conflictIndex = logIndexOnFollower;
-                    logger.info(nodeId + " [handleAppendEntries] Conflict detected at index " + conflictIndex +
-                            ". My term: " + log.get(conflictIndex).getTerm() +
-                            ", Leader's entry term: " + args.getEntries(i).getTerm() + ". Truncating log.");
+            int logIndex = entriesStartIndex + i;
+            if (logIndex < log.size()) {
+                if (log.get(logIndex).getTerm() != args.getEntries(i).getTerm()) {
+                    conflictIndex = logIndex;
                     break;
                 }
             } else {
+                // No more entries in our log, no conflict
                 break;
             }
         }
 
+        // Delete conflicting entries and everything after
         if (conflictIndex != -1) {
             while (log.size() > conflictIndex) {
                 log.removeLast();
             }
-            logger.info(nodeId + " [handleAppendEntries] Log truncated due to conflict. New size: " + log.size());
         }
 
-        int followerLogPositionForNewEntries = (int) args.getPrevLogIndex() + 1;
-        int entriesActuallyAppended = 0;
-        for (int i = 0; i < args.getEntriesCount(); i++) {
-            LogEntry leaderEntry = args.getEntries(i);
-            if (followerLogPositionForNewEntries < log.size()) {
-                if (log.get(followerLogPositionForNewEntries).getTerm() == leaderEntry.getTerm()) {
-                    followerLogPositionForNewEntries++;
-                } else {
-                    logger.warning(nodeId + " [handleAppendEntries] Unexpected new conflict at index " + followerLogPositionForNewEntries +
-                            " during append phase. My term: " + log.get(followerLogPositionForNewEntries).getTerm() +
-                            ", Leader's entry term: " + leaderEntry.getTerm() + ". Truncating again from here.");
-                    while (log.size() > followerLogPositionForNewEntries) {
-                        log.removeLast();
-                    }
-                    log.add(leaderEntry);
-                    entriesActuallyAppended++;
-                    followerLogPositionForNewEntries++;
-                }
-            } else {
-                log.add(leaderEntry);
-                entriesActuallyAppended++;
-                followerLogPositionForNewEntries++;
+        // Append new entries that aren't already in our log
+        // Start appending from where our log ends
+        int startAppendIndex = Math.max(0, log.size() - entriesStartIndex);
+
+        for (int i = startAppendIndex; i < args.getEntriesCount(); i++) {
+            log.add(args.getEntries(i));
+        }
+
+        // Check for configuration changes in the entries we just processed
+        // We need to check ALL entries that were added to the log, not just the newly appended ones
+        int configCheckStart = Math.max(0, Math.min(startAppendIndex, conflictIndex != -1 ? conflictIndex - entriesStartIndex : Integer.MAX_VALUE));
+
+        for (int i = configCheckStart; i < args.getEntriesCount(); i++) {
+            LogEntry entry = args.getEntries(i);
+            if (entry.getType().equals(LogEntry.LogType.C_OLD_NEW)) {
+                applyOldNewEntry(entry);
+            }
+            if (entry.getType().equals(LogEntry.LogType.C_NEW)) {
+                applyNewEntry(entry);
             }
         }
 
-        if (entriesActuallyAppended > 0) {
-            logger.info(nodeId + " [handleAppendEntries] Appended " + entriesActuallyAppended + " new entries. Log size now: " + log.size());
-        }
-
-        int configScanStartIndex = (int) args.getPrevLogIndex() + 1;
-        for (int i = configScanStartIndex; i < log.size(); i++) {
-            int entryIndexInArgs = i - ((int) args.getPrevLogIndex() + 1);
-            if (entryIndexInArgs >= 0 && entryIndexInArgs < args.getEntriesCount()) {
-                LogEntry currentLogEntry = log.get(i);
-                if (currentLogEntry.getType().equals(LogEntry.LogType.C_OLD_NEW)) {
-                    logger.info(nodeId + " [handleAppendEntries] Applying C_OLD_NEW config from log at index " + i);
-                    applyOldNewEntry(currentLogEntry);
-                }
-                if (currentLogEntry.getType().equals(LogEntry.LogType.C_NEW)) {
-                    logger.info(nodeId + " [handleAppendEntries] Applying C_NEW config from log at index " + i);
-                    applyNewEntry(currentLogEntry);
-                }
-            }
-        }
-
-
+        // update commit
         if (args.getLeaderCommit() > commitIndex.get()) {
-            long newFollowerCommitIndex = Math.min(args.getLeaderCommit(), log.size() - 1);
-            if (newFollowerCommitIndex < 0) newFollowerCommitIndex = 0;
-
-            if (newFollowerCommitIndex > commitIndex.get()) {
-                logger.info(nodeId + " [handleAppendEntries] Updating commitIndex from " + commitIndex.get() + " to " + newFollowerCommitIndex);
-                commitIndex.set(newFollowerCommitIndex);
+            long newCommitIndex = Math.min(args.getLeaderCommit(), log.size() - 1);
+            if (newCommitIndex > commitIndex.get()) {
+                commitIndex.set(newCommitIndex);
                 applyCommitedEntries();
             }
         }
 
-        if (args.getEntriesCount() == 0 && entriesActuallyAppended == 0) {
-            logger.fine(nodeId + " [handleAppendEntries] Processed heartbeat from " + args.getLeaderId() + ". My log size: " + log.size());
-        } else if (entriesActuallyAppended > 0 || args.getEntriesCount() > 0) { // Log if any entries were processed or received
-            logger.info(nodeId + " [handleAppendEntries] Processed append entries from " + args.getLeaderId() +
-                    ". Entries in RPC: " + args.getEntriesCount() + ", Entries appended: " + entriesActuallyAppended +
-                    ". My log size: " + log.size());
+        if (args.getEntriesCount() == 0) {
+            logger.info("Received heart beat");
+        } else {
+            logger.info("Received append entries");
         }
 
         return AppendEntriesReply.newBuilder()
