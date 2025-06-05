@@ -150,7 +150,7 @@ public class Client {
                     } catch (StatusRuntimeException e) {
                         System.out.println("ERROR: Failed to add member: " + e.getStatus());
                     }
-                    redirects = MAX_REDIRECTS;
+                    return;
                 } else if (rawCommand.startsWith("REMOVE_MEMBER")) {
                     String[] res = commandString.split(" ");
                     String nodeId = res[1];
@@ -168,7 +168,7 @@ public class Client {
                     } catch (StatusRuntimeException e) {
                         System.out.println("ERROR: Failed to add member: " + e.getStatus());
                     }
-                    redirects = MAX_REDIRECTS;
+                    return;
                 } else {
                     String[] res = commandString.split(" ");
                     String cmd = res[0];
