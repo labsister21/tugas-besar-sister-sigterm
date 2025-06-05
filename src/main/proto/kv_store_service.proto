@@ -37,9 +37,23 @@ message RequestLogReply {
   string leaderAddress = 3;
 }
 
+message MemberChangeArgs {
+  enum ChangeType {
+    ADD = 0;
+    REMOVE = 1;
+  }
+  ChangeType type = 1;
+  string nodeId = 2;
+  optional string nodeAddress = 3;
+}
+
+message MemberChangeReply {
+  bool success = 1;
+  string error_message = 2;
+}
+
 service KVStoreService {
   rpc ExecuteCommand(ClientRequest) returns (ClientResponse);
   rpc RequestLog(RequestLogArgs) returns (RequestLogReply);
+  rpc ChangeMembership(MemberChangeArgs) returns (MemberChangeReply);
 }
-
-// TODO: add command for membership change

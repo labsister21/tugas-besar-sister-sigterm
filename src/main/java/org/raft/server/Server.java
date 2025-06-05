@@ -1,7 +1,6 @@
 package org.raft.server;
 
 import io.grpc.ServerBuilder;
-import io.grpc.ServerServiceDefinition;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;

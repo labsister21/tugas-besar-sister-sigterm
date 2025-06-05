@@ -1,8 +1,6 @@
 package org.raft.server;
 
-import org.raft.kvstore.rpc.ClientRequest;
-import org.raft.kvstore.rpc.ClientResponse;
-import org.raft.kvstore.rpc.RequestLogReply;
+import org.raft.kvstore.rpc.*;
 import org.raft.raft.rpc.*;
 
 import java.util.*;
@@ -20,16 +18,18 @@ public class RaftNode {
     private final Map<String, Peer> peers = new ConcurrentHashMap<>();
 
     // Persistent state on all servers
-    private AtomicLong currentTerm = new AtomicLong(0);
-    private String votedFor = null;
+    private final AtomicLong currentTerm = new AtomicLong(0);
+    private volatile String votedFor = null; // Made volatile for thread safety
     private final List<LogEntry> log = new CopyOnWriteArrayList<>();
 
     // Volatile state on all servers
     private volatile NodeState currentState = NodeState.FOLLOWER;
-    private AtomicLong commitIndex = new AtomicLong(0);
-    private AtomicLong lastApplied = new AtomicLong(0);
-    private AtomicLong currElectionTimeOut = new AtomicLong(0);
-    private String currentLeaderId = null;
+    private final AtomicLong commitIndex = new AtomicLong(0);
+    private final AtomicLong lastApplied = new AtomicLong(0);
+    private final AtomicLong currElectionTimeOut = new AtomicLong(0);
+    private volatile String currentLeaderId = null; // Made volatile
+
+    private final AtomicLong lastLeaderCommunicationTime = new AtomicLong(0);
 
     // State Machine (Key-Value Store)
     private final ConcurrentHashMap<String, String> keyValueStore = new ConcurrentHashMap<>();
@@ -39,12 +39,15 @@ public class RaftNode {
     private ScheduledFuture<?> electionTimeoutTask;
     private ScheduledFuture<?> heartbeatTask;
     private final Random random = new Random();
-    private static final int ELECTION_TIMEOUT_MIN = 250;
-    private static final int ELECTION_TIMEOUT_MAX = 1000;
-    private static final int HEARTBEAT_INTERVAL_MS = 100;
+    private static final int ELECTION_TIMEOUT_MIN = 2500;
+    private static final int ELECTION_TIMEOUT_MAX = 4000;
+    private static final int HEARTBEAT_INTERVAL_MS = 1000;
 
-    // client request map
-    private Map<Long, CompletableFuture<ClientResponse>> clientRequestFutures = new ConcurrentHashMap<>();
+    // client request map for completable future
+    private final Map<Long, CompletableFuture<ClientResponse>> clientRequestFutures = new ConcurrentHashMap<>();
+
+    // client membership change map
+    private final Map<Long, CompletableFuture<MemberChangeReply>> clientMemberChangeFutures = new ConcurrentHashMap<>();
 
     // executor for election threads
     private final ExecutorService electionRpcExecutor = Executors.newCachedThreadPool(
@@ -72,39 +75,59 @@ public class RaftNode {
             }
     );
 
+    // state for membership change
+    private volatile Set<String> stableConfig;
+    private volatile Set<String> oldConfig;
+    private volatile Set<String> newConfig;
+    private volatile boolean inJointConsensus = false;
+    private Map<String, String> pendingNewPeerAddresses = new ConcurrentHashMap<>();
+
     // constructor
     public RaftNode(String nodeId, String selfAddress, List<String> peerAddresses) {
         this.nodeId = nodeId;
         this.selfAddress = selfAddress;
 
+        this.stableConfig = new CopyOnWriteArraySet<>();
+        this.stableConfig.add(nodeId);
         for (String peerAddress : peerAddresses) {
             String[] parts = peerAddress.split(",");
             String peerId = parts[0];
             String peerAddr = parts[1];
             if (!peerId.equals(nodeId)) {
                 this.peers.put(peerId, new Peer(peerId, peerAddr));
+                this.stableConfig.add(peerId);
             }
         }
 
         // placeholder entry
-        log.add(LogEntry.newBuilder().setTerm(0).setCommand("").build());
+        log.add(LogEntry.newBuilder().setTerm(0).setType(LogEntry.LogType.SENTINEL).build());
         resetElectionTimer();
     }
 
     /* STATE TRANSITION */
     // method to become follower
     private synchronized void becomeFollower(long term) {
+        boolean termIncreased = term > currentTerm.get();
+        boolean wasNotFollower = currentState != NodeState.FOLLOWER;
+
+        if (termIncreased || wasNotFollower) {
+            logger.info(nodeId + " becoming follower for term " + term + " (was " + currentState + ", oldTerm: " + currentTerm.get() +")");
+        }
+
         if (term > currentTerm.get()) {
-            logger.info(nodeId + " becoming Follower for term " + term + " (was " + currentState + ")");
-            currentState = NodeState.FOLLOWER;
             currentTerm.set(term);
             votedFor = null;
-
-            if (heartbeatTask != null && !heartbeatTask.isDone()) {
-                heartbeatTask.cancel(false);
-            }
-            resetElectionTimer();
+            currentLeaderId = null; // Leader for new term is unknown
+        } else if (term < currentTerm.get()) {
+            logger.warning(nodeId + " tried to become follower with older term " + term + ", current is " + currentTerm.get());
+            return;
         }
+        currentState = NodeState.FOLLOWER;
+
+        if (heartbeatTask != null && !heartbeatTask.isDone()) {
+            heartbeatTask.cancel(false);
+        }
+        resetElectionTimer();
     }
 
     // method to become candidate
@@ -113,6 +136,7 @@ public class RaftNode {
         currentState = NodeState.CANDIDATE;
         currentTerm.incrementAndGet();
         votedFor = nodeId;
+        lastLeaderCommunicationTime.set(0);
         currentLeaderId = null;
         resetElectionTimer();
         startElection();
@@ -127,6 +151,9 @@ public class RaftNode {
         logger.info(nodeId + " becoming Leader for term " + currentTerm.get());
         currentState = NodeState.LEADER;
         currentLeaderId = nodeId;
+        votedFor = null;
+
+        lastLeaderCommunicationTime.set(System.currentTimeMillis());
 
         if (electionTimeoutTask != null && !electionTimeoutTask.isDone()) {
             electionTimeoutTask.cancel(true);
@@ -174,6 +201,7 @@ public class RaftNode {
     /* ELECTION RELATED METHODS */
     // start election for candidates
     private void startElection() {
+        logger.info(nodeId + " starts a new election");
         final long term = currentTerm.get();
         final long lastLogIdx = log.size() - 1;
         final long lastLogTermVal = (lastLogIdx >= 0 && lastLogIdx < log.size()) ? log.get((int) lastLogIdx).getTerm() : 0;
@@ -186,6 +214,30 @@ public class RaftNode {
                 .build();
 
         AtomicInteger votesReceived = new AtomicInteger(1);
+        AtomicInteger votesOld = new AtomicInteger(0);
+        AtomicInteger votesNew = new AtomicInteger(0);
+        final boolean inTransitionChange = this.inJointConsensus;
+        final Set<String> currOldConfig = inTransitionChange ? new HashSet<>(this.oldConfig) : new HashSet<>();
+        final Set<String> currNewConfig = inTransitionChange ? new HashSet<>(this.newConfig) : new HashSet<>();
+
+        if (inTransitionChange) {
+            if (currOldConfig.contains(nodeId)) {
+                votesOld.incrementAndGet();
+            }
+            if (currNewConfig.contains(nodeId)) {
+                votesNew.incrementAndGet();
+            }
+        }
+
+        // Handle single node case
+        if (peers.isEmpty()) {
+            synchronized (this) {
+                if (currentState == NodeState.CANDIDATE && currentTerm.get() == term) {
+                    becomeLeader();
+                }
+            }
+            return;
+        }
 
         for (Peer peer : peers.values()) {
             if (currentState != NodeState.CANDIDATE || currentTerm.get() != term) {
@@ -199,6 +251,7 @@ public class RaftNode {
                     }
                     RequestVoteReply reply = peer.getBlockingStub().withDeadlineAfter(currElectionTimeOut.get(), TimeUnit.MILLISECONDS).requestVote(request);
                     synchronized (RaftNode.this) {
+                        logger.info(nodeId + " received vote response from reply");
                         if (reply.getTerm() > currentTerm.get()) {
                             becomeFollower(reply.getTerm());
                             return;
@@ -207,16 +260,47 @@ public class RaftNode {
                         if (currentState == NodeState.CANDIDATE && currentTerm.get() == term && reply.getTerm() == term) {
                             if (reply.getVoteGranted()) {
                                 votesReceived.incrementAndGet();
-                                if (votesReceived.get() >= (peers.size() + 1) / 2 + 1) {
+                                if (inTransitionChange) {
+                                    if (currOldConfig.contains(peer.getNodeId())) {
+                                        votesOld.incrementAndGet();
+                                    }
+                                    if (currNewConfig.contains(peer.getNodeId())) {
+                                        votesNew.incrementAndGet();
+                                    }
+                                }
+                                if (checkWin(votesReceived, votesOld, votesNew, term, inTransitionChange, currOldConfig, currNewConfig)) {
+                                    logger.info(nodeId + " become leader.");
                                     becomeLeader();
                                 }
                             }
                         }
                     }
                 } catch (Exception e) {
-                    // TODO: handle case?
+                    logger.fine(nodeId + " election RPC to " + peer.getNodeId() + " failed: " + e.getMessage());
                 }
             }, electionRpcExecutor);
+        }
+    }
+
+    private synchronized boolean checkWin(AtomicInteger totalVote, AtomicInteger oldVotes, AtomicInteger newVotes, long term, boolean isInTransition, Set<String> oldSnapshot, Set<String> newSnapshot) {
+        if (currentState != NodeState.CANDIDATE || currentTerm.get() != term) {
+            return false;
+        }
+        if (isInTransition) {
+            int oldsize = oldSnapshot.size();
+            int newSize = newSnapshot.size();
+
+            if (oldsize == 0 && newSize == 0) {
+                // unreachable i think
+                return false;
+            }
+
+            boolean winOld = (oldVotes.get() >= oldsize / 2 + 1);
+            boolean winNew = (newVotes.get() >= newSize / 2 + 1);
+            return winNew && winOld;
+        } else {
+            int stableSize = stableConfig.size();
+            return (totalVote.get() >= stableSize / 2 + 1);
         }
     }
 
@@ -224,6 +308,16 @@ public class RaftNode {
     public synchronized RequestVoteReply handleRequestVote(RequestVoteArgs args) {
         logger.fine(nodeId + " received RequestVote from " + args.getCandidateId() + " for term " + args.getTerm() +
                 " (my term: " + currentTerm.get() + ", votedFor: " + votedFor + ")");
+
+        // Check leader communication timeout
+        long currentTime = System.currentTimeMillis();
+        if (currentTime - lastLeaderCommunicationTime.get() < ELECTION_TIMEOUT_MIN && currentLeaderId != null) {
+            logger.fine(nodeId + " rejecting vote for " + args.getCandidateId() + " - recent leader communication");
+            return RequestVoteReply.newBuilder()
+                    .setTerm(currentTerm.get())
+                    .setVoteGranted(false)
+                    .build();
+        }
 
         boolean voteGranted = false;
         if (args.getTerm() < currentTerm.get()) {
@@ -236,7 +330,7 @@ public class RaftNode {
             resetElectionTimer();
         }
 
-        // check candidates
+        // check candidates log up-to-date
         boolean logOk = false;
         long myLastLogTerm = (!log.isEmpty()) ? log.getLast().getTerm() : 0;
         long myLastLogIndex = log.size() - 1;
@@ -264,6 +358,7 @@ public class RaftNode {
             if (currentState != NodeState.LEADER) {
                 return;
             }
+            lastLeaderCommunicationTime.set(System.currentTimeMillis());
             logger.fine(nodeId + " (Leader) sending heartbeats for term " + currentTerm.get());
             sendAppendEntries(true);
         }
@@ -279,6 +374,7 @@ public class RaftNode {
 
     // send append entries to a single peer
     private void sendAppendEntries(Peer peer, boolean isHeartBeat) {
+        logger.info(nodeId + " sends append entries to " + peer.getNodeId());
         if (currentState != NodeState.LEADER) return;
         final long nextIdx = peer.getNextIndex();
         long prevLogIdx = Math.max(0, nextIdx - 1);
@@ -309,31 +405,32 @@ public class RaftNode {
             try {
                 if (currentState != NodeState.LEADER) return;
                 AppendEntriesReply reply = peer.getBlockingStub().withDeadlineAfter(5000, TimeUnit.MILLISECONDS).appendEntries(request);
-                if (reply.getTerm() > currentTerm.get()) {
-                    becomeFollower(reply.getTerm());
-                    return;
-                }
 
-                if (reply.getTerm() == currentTerm.get()) {
-                    if (reply.getSuccess()) {
-                        long newMatchIndex = request.getPrevLogIndex() + request.getEntriesCount();
-                        long newNextIndex = newMatchIndex + 1;
-                        peer.setNodeMatchIndex(newMatchIndex);
-                        peer.setNextIndex(newNextIndex);
+                synchronized (this) {
+                    if (reply.getTerm() > currentTerm.get()) {
+                        becomeFollower(reply.getTerm());
+                        return;
+                    }
 
-                        // update commit index
-                        updateCommitIndex();
-                    } else if (!isHeartBeat) {
-                        // send again if not heart beat
-                        long newNextIdx = Math.max(1, peer.getNextIndex() - 1);
-                        peer.setNextIndex(newNextIdx);
-                        sendAppendEntries(peer, false);
+                    if (reply.getTerm() == currentTerm.get() && currentState == NodeState.LEADER) {
+                        if (reply.getSuccess()) {
+                            long newMatchIndex = request.getPrevLogIndex() + request.getEntriesCount();
+                            long newNextIndex = newMatchIndex + 1;
+                            peer.setNodeMatchIndex(newMatchIndex);
+                            peer.setNextIndex(newNextIndex);
+
+                            // update commit index
+                            updateCommitIndex();
+                        } else if (!isHeartBeat) {
+                            long newNextIdx = Math.max(1, peer.getNextIndex() - 1);
+                            peer.setNextIndex(newNextIdx);
+                            sendAppendEntries(peer, false);
+                        }
                     }
                 }
 
             } catch (Exception e) {
-                if (!isHeartBeat) {
-                    // send again if not heart beat
+                if (!isHeartBeat && currentState == NodeState.LEADER) {
                     long newNextIdx = Math.max(1, peer.getNextIndex() - 1);
                     peer.setNextIndex(newNextIdx);
                     sendAppendEntries(peer, false);
@@ -344,38 +441,71 @@ public class RaftNode {
 
     // handle append entries respond
     public synchronized AppendEntriesReply handleAppendEntries(AppendEntriesArgs args) {
+        // early return for old terms
         if (args.getTerm() < currentTerm.get()) {
-            AppendEntriesReply.newBuilder().setTerm(currentTerm.get()).setSuccess(false).setMatchIndex(0).build();
+            return AppendEntriesReply.newBuilder()
+                    .setTerm(currentTerm.get())
+                    .setSuccess(false)
+                    .setMatchIndex(0)
+                    .build();
         }
 
-        // check if current log contain the entry in log
-        if (args.getPrevLogIndex() >= log.size() || args.getPrevLogIndex() < 0 || args.getPrevLogTerm() != log.get((int) args.getPrevLogIndex()).getTerm()) {
-            AppendEntriesReply.newBuilder().setTerm(currentTerm.get()).setSuccess(false).setMatchIndex(0).build();
-        }
-
+        // valid append entries received
+        lastLeaderCommunicationTime.set(System.currentTimeMillis());
         currentLeaderId = args.getLeaderId();
-        if (args.getTerm() > currentTerm.get() || (currentState == NodeState.CANDIDATE && currentTerm.get() == args.getTerm())) {
+
+        if (args.getTerm() > currentTerm.get() ||
+                (currentState == NodeState.CANDIDATE && currentTerm.get() == args.getTerm())) {
             becomeFollower(args.getTerm());
         } else {
             resetElectionTimer();
         }
 
-        // delete wrong entries
-        int startIdx = 0;
-        for (int i = (int) args.getPrevLogIndex() + 1; i < log.size(); i++) {
-            if (log.get(i).getTerm() != args.getEntries(i - ((int) args.getPrevLogIndex() + 1)).getTerm()) {
-                while (i < log.size()) {
-                    log.remove(i);
-                    i++;
-                }
-                break;
-            }
-            startIdx++;
+        // check log consistency
+        if (args.getPrevLogIndex() >= log.size() || args.getPrevLogIndex() < 0 ||
+                log.get((int) args.getPrevLogIndex()).getTerm() != args.getPrevLogTerm()) {
+            return AppendEntriesReply.newBuilder()
+                    .setTerm(currentTerm.get())
+                    .setSuccess(false)
+                    .setMatchIndex(0)
+                    .build();
         }
 
-        // append new entries
-        for (int i = 0; i < startIdx; i++) {
+        int conflictIndex = -1;
+        for (int i = 0; i < args.getEntriesCount(); i++) {
+            int logIndex = (int) args.getPrevLogIndex() + 1 + i;
+            if (logIndex < log.size()) {
+                if (log.get(logIndex).getTerm() != args.getEntries(i).getTerm()) {
+                    conflictIndex = logIndex;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // delete conflicting entries and everything after
+        if (conflictIndex != -1) {
+            while (log.size() > conflictIndex) {
+                log.removeLast();
+            }
+        }
+
+        // only append new entries that aren't already in log
+        int startAppendIndex = Math.max(0, (int) args.getPrevLogIndex() + 1 - log.size());
+        for (int i = startAppendIndex; i < args.getEntriesCount(); i++) {
             log.add(args.getEntries(i));
+        }
+
+        // check if there's a configuration change entry
+        for (int i = startAppendIndex; i < args.getEntriesCount(); i++) {
+            LogEntry l = args.getEntries(i);
+            if (l.getType().equals(LogEntry.LogType.C_OLD_NEW)) {
+                applyOldNewEntry(l);
+            }
+            if (l.getType().equals(LogEntry.LogType.C_NEW)) {
+                applyNewEntry(l);
+            }
         }
 
         // update commit
@@ -398,32 +528,72 @@ public class RaftNode {
     private synchronized void updateCommitIndex() {
         if (currentState != NodeState.LEADER) return;
 
-        long newCommitIndex = commitIndex.get() + 1;
-        long commIdx = commitIndex.get();
-        for (; newCommitIndex < log.size(); newCommitIndex++) {
+        for (long newCommitIndex = commitIndex.get() + 1; newCommitIndex < log.size(); newCommitIndex++) {
             LogEntry entry = log.get((int) newCommitIndex);
             if (entry.getTerm() != currentTerm.get()) {
                 continue;
             }
 
-            // check if majority has voted
-            int aknowledgment = 1;
-            for (Peer peer : peers.values()) {
-                if (peer.getNodeMatchIndex() >= newCommitIndex) {
-                    aknowledgment++;
-                }
-            }
-            int totalPeer = peers.size();
-            if (aknowledgment >= totalPeer / 2 + 1) {
-                commIdx = newCommitIndex;
+            if (checkAknowledgement(newCommitIndex)) {
+                commitIndex.set(newCommitIndex);
             } else {
                 break;
             }
         }
-        commitIndex.set(commIdx);
+
         if (commitIndex.get() > lastApplied.get()) {
             // apply committed entries
             applyCommitedEntries();
+        }
+    }
+
+    // method to check if the majority of nodes has acknowledged this
+    private synchronized boolean checkAknowledgement(long targetLogIndex) {
+        if (currentState != NodeState.LEADER) {
+            return false;
+        }
+
+        if (inJointConsensus) {
+            if (oldConfig.isEmpty() || newConfig.isEmpty()) {
+                return false;
+            }
+            int oldAcks = 0;
+            int newAcks = 0;
+            if (oldConfig.contains(nodeId)) {
+                oldAcks++;
+            }
+            if (newConfig.contains(nodeId)) {
+                newAcks++;
+            }
+            for (String peerId : oldConfig) {
+                if (!peerId.equals(nodeId) && peers.containsKey(peerId) && peers.get(peerId).getNodeMatchIndex() >= targetLogIndex) {
+                    oldAcks++;
+                }
+            }
+            for (String peerId : newConfig) {
+                if (!peerId.equals(nodeId) && peers.containsKey(peerId) && peers.get(peerId).getNodeMatchIndex() >= targetLogIndex) {
+                    newAcks++;
+                }
+            }
+            boolean isOldMajority = oldAcks >= (oldConfig.size() / 2 + 1);
+            boolean isNewMajority = newAcks >= (newConfig.size() / 2 + 1);
+            return isNewMajority && isOldMajority;
+        } else {
+            if (stableConfig.isEmpty()) {
+                // this should be unreachable i guess
+                return false;
+            }
+
+            int ack = 0;
+            if (stableConfig.contains(nodeId)) {
+                ack++;
+            }
+            for (String peerId : stableConfig) {
+                if (!peerId.equals(nodeId) && peers.containsKey(peerId) && peers.get(peerId).getNodeMatchIndex() >= targetLogIndex) {
+                    ack++;
+                }
+            }
+            return ack >= (stableConfig.size() / 2 + 1);
         }
     }
 
@@ -436,40 +606,58 @@ public class RaftNode {
                 break;
             }
             LogEntry currLog = log.get((int) applyIdx);
-            String res = applyCommand(currLog.getCommand());
-            completeClientFuture(applyIdx, res, true);
+            String res = "OK";
+            boolean success = true;
+
+            if (currLog.getType().equals(LogEntry.LogType.C_OLD_NEW)) {
+                applyCommitedOldNewEntry(currLog);
+                completeChangeMembershipFuture(applyIdx);
+            } else if (currLog.getType().equals(LogEntry.LogType.C_NEW)) {
+                applyCommitedNewEntry(currLog);
+                completeChangeMembershipFuture(applyIdx);
+            } else {
+                res = applyCommand(currLog.getType().name(), currLog.getKey(), currLog.getValue());
+                if (res.startsWith("ERROR")) {
+                    success = false;
+                }
+                completeClientFuture(applyIdx, res, success);
+            }
         }
     }
 
-    // method that apply command to the machine state
-    // and return the result/error message
-    private synchronized String applyCommand(String command) {
-        String[] parts = command.split(" ", 3);
-        String cmd = (parts.length > 0) ? parts[0] : null;
-        String key = (parts.length > 1) ? parts[1] : null;
-        String value = (parts.length > 2) ? parts[2] : null;
-
+    private synchronized String applyCommand(String cmd, String key, String value) {
         if (cmd != null) {
             return switch (cmd) {
-                case "PING" -> "PONG";
-                case "GET" -> keyValueStore.getOrDefault(key, "ERROR: Key not found");
+                case "GET" -> {
+                    if (key != null && !key.isEmpty()) {
+                        yield keyValueStore.getOrDefault(key, "ERROR: Key not found");
+                    } else {
+                        yield "ERROR: Missing key for GET";
+                    }
+                }
                 case "SET" -> {
-                    if (key != null && value != null) {
+                    if (key != null && value != null && !key.isEmpty() && !value.isEmpty()) {
                         keyValueStore.put(key, value);
                         yield "OK";
                     }
                     yield "ERROR: Missing key or value for SET";
                 }
-                case "STRLEN" -> String.valueOf(keyValueStore.getOrDefault(key, "").length());
+                case "STRLEN" -> {
+                    if (key != null && !key.isEmpty()) {
+                        yield String.valueOf(keyValueStore.getOrDefault(key, "").length());
+                    } else {
+                        yield "ERROR: Missing key for STRLEN";
+                    }
+                }
                 case "DEL" -> {
-                    if (key != null) {
+                    if (key != null && !key.isEmpty()) {
                         String val = keyValueStore.remove(key);
                         yield val != null ? val : "";
                     }
-                    yield "";
+                    yield "ERROR: Missing key for DEL";
                 }
                 case "APPEND" -> {
-                    if (key != null && value != null) {
+                    if (key != null && value != null && !key.isEmpty() && !value.isEmpty()) {
                         keyValueStore.compute(key, (k, v) -> (v == null) ? value : v + value);
                         yield "OK";
                     }
@@ -478,8 +666,7 @@ public class RaftNode {
                 default -> "ERROR: Unknown command '" + cmd + "'";
             };
         }
-
-        return "ERROR: Unknown command '" + command + "'";
+        return "ERROR: Missing command";
     }
 
     /* CLIENT REQUEST HANDLING */
@@ -491,7 +678,7 @@ public class RaftNode {
         final String cmd = type.name();
 
         CompletableFuture<ClientResponse> responseFuture = new CompletableFuture<>();
-        long tmp = 0;
+        long tmp;
         synchronized (this) {
             if (currentState != NodeState.LEADER) {
                 String leaderAddr = getPeerAddress(getCurrentLeaderId());
@@ -507,7 +694,7 @@ public class RaftNode {
             // if ping just response
             if (type == ClientRequest.CommandType.PING) {
                 String leaderAddr = getPeerAddress(getCurrentLeaderId());
-                String res = applyCommand("PING");
+                String res = "PONG";
                 ClientResponse pongResponse = ClientResponse.newBuilder()
                         .setSuccess(true)
                         .setLeaderAddress(!leaderAddr.isEmpty() ? leaderAddr : "")
@@ -516,35 +703,18 @@ public class RaftNode {
                 responseFuture.complete(pongResponse);
                 logger.info("This is ping");
                 return pongResponse;
-            } else if (type == ClientRequest.CommandType.GET || type == ClientRequest.CommandType.STRLEN) {
-                String leaderAddr = getPeerAddress(getCurrentLeaderId());
-                String res = applyCommand(cmd + " " + key);
-                ClientResponse getResponse = ClientResponse.newBuilder()
-                        .setSuccess(true)
-                        .setLeaderAddress(!leaderAddr.isEmpty() ? leaderAddr : "")
-                        .setResult(res)
-                        .build();
-                responseFuture.complete(getResponse);
-                logger.info("This is get");
-                return getResponse;
             } else {
-                StringBuilder command = new StringBuilder(cmd);
-                if (!key.isEmpty()) {
-                    command.append(" ").append(key);
-                }
-                if (!value.isEmpty()) {
-                    command.append(" ").append(value);
-                }
                 LogEntry newEntry = LogEntry.newBuilder()
                         .setTerm(currentTerm.get())
-                        .setCommand(command.toString())
+                        .setKey(key)
+                        .setValue(value)
+                        .setType(LogEntry.LogType.valueOf(cmd))
                         .build();
                 log.add(newEntry);
                 long entryIndex = log.size() - 1;
                 tmp = entryIndex;
                 clientRequestFutures.put(entryIndex, responseFuture);
                 sendAppendEntries(false);
-                updateCommitIndex();
             }
         }
 
@@ -581,6 +751,214 @@ public class RaftNode {
                 responseBuilder.setLeaderAddress(getPeerAddress(currentLeaderId));
             }
             future.complete(responseBuilder.build());
+        }
+    }
+
+    private void completeChangeMembershipFuture(long logIndex) {
+        CompletableFuture<MemberChangeReply> future = clientMemberChangeFutures.remove(logIndex);
+        if (future != null) {
+            MemberChangeReply reply = MemberChangeReply.newBuilder().setSuccess(true).setErrorMessage("".isEmpty() ? "" : "").build();
+            future.complete(reply);
+        }
+    }
+
+    /* MEMBERSHIP CHANGE RELATED FUNCTIONS */
+    public synchronized MemberChangeReply handleChangeMembership(MemberChangeArgs request) {
+        final String type = request.getType().name();
+        final String newNodeId = request.getNodeId();
+        final String newNodeAddress = request.getNodeAddress();
+
+        CompletableFuture<MemberChangeReply> responseFuture = new CompletableFuture<>();
+        long tmp;
+        synchronized (this) {
+            if (currentState != NodeState.LEADER) {
+                MemberChangeReply res = MemberChangeReply.newBuilder().setSuccess(false).setErrorMessage("ERROR: This node is not a leader").build();
+                responseFuture.complete(res);
+                logger.warning("This node is not a leader");
+                return res;
+            }
+
+            if (inJointConsensus) {
+                MemberChangeReply res = MemberChangeReply.newBuilder().setSuccess(false).setErrorMessage("ERROR: Another config change already in progress").build();
+                responseFuture.complete(res);
+                logger.warning("Another config change already in progress");
+                return res;
+            }
+
+            // get old config
+            Set<String> confOld = new HashSet<>(stableConfig);
+            Set<String> confNew = new HashSet<>(stableConfig);
+            pendingNewPeerAddresses.clear();
+
+            if (type.equals("ADD")) {
+                confNew.add(newNodeId);
+                Peer newPeer = new Peer(newNodeId, newNodeAddress);
+                newPeer.setNextIndex(log.size());
+                newPeer.setNodeMatchIndex(0);
+                this.peers.put(newNodeId, newPeer);
+
+                // TODO: become passive observer first until it gets to the latest leader index
+            } else {
+                confNew.remove(newNodeId);
+            }
+            for (Peer peer : peers.values()) {
+                pendingNewPeerAddresses.put(peer.getNodeId(), peer.getAddress());
+            }
+            this.oldConfig = confOld;
+            this.newConfig = confNew;
+            this.inJointConsensus = true;
+
+            // create node map
+            ArrayList<String> nodeMap = new ArrayList<>();
+            nodeMap.add(this.nodeId + "=" + this.selfAddress);
+
+            for (Peer peer : peers.values()) {
+                nodeMap.add(peer.getNodeId() + "=" + peer.getAddress());
+            }
+
+            LogEntry newEntry = LogEntry.newBuilder()
+                    .setTerm(currentTerm.get())
+                    .setType(LogEntry.LogType.C_OLD_NEW)
+                    .addAllOldConf(new ArrayList<>(oldConfig))
+                    .addAllNewConf(new ArrayList<>(newConfig))
+                    .addAllNodeMap(nodeMap)
+                    .build();
+            log.add(newEntry);
+            long entryIdx = log.size() - 1;
+            tmp = entryIdx;
+            clientMemberChangeFutures.put(entryIdx, responseFuture);
+            sendAppendEntries(false);
+        }
+
+        try {
+            return responseFuture.get(10, TimeUnit.SECONDS);
+        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+            clientMemberChangeFutures.remove(tmp);
+            return MemberChangeReply.newBuilder().setSuccess(false).setErrorMessage("ERROR: failed to do member change").build();
+        }
+    }
+
+    private synchronized void applyOldNewEntry(LogEntry entry) {
+        Set<String> confOld = new HashSet<>(entry.getOldConfList());
+        Set<String> confNew = new HashSet<>(entry.getNewConfList());
+
+        this.inJointConsensus = true;
+        this.oldConfig = confOld;
+        this.newConfig = confNew;
+
+        // construct nodeMap
+        Map<String, String> nodeMap = new HashMap<>();
+        for (String raw : entry.getNodeMapList()) {
+            String[] parts = raw.split("=");
+            logger.info(Arrays.toString(parts));
+            String id = parts[0];
+            String address = parts[1];
+            nodeMap.put(id, address);
+        }
+        pendingNewPeerAddresses = nodeMap;
+
+        // check if there's node in old that hasn't been connected yet
+        for (String oldNode : confOld) {
+            if (!peers.containsKey(oldNode) && !oldNode.equals(this.nodeId)) {
+                Peer peer = new Peer(oldNode, nodeMap.get(oldNode));
+                peer.setNextIndex(log.size());
+                peer.setNodeMatchIndex(0);
+                this.peers.put(oldNode, peer);
+            }
+        }
+
+        // check if there's node in new that hasn't been connected yet
+        for (String newNode : confNew) {
+            if (!peers.containsKey(newNode) && !newNode.equals(this.nodeId)) {
+                Peer peer = new Peer(newNode, nodeMap.get(newNode));
+                peer.setNextIndex(log.size());
+                peer.setNodeMatchIndex(0);
+                this.peers.put(newNode, peer);
+            }
+        }
+    }
+
+    private synchronized void applyNewEntry(LogEntry entry) {
+        Set<String> newConf = new HashSet<>(entry.getNewConfList());
+        this.stableConfig = newConf;
+        this.oldConfig = new HashSet<>();
+        this.newConfig = new HashSet<>();
+        this.inJointConsensus = false;
+        this.pendingNewPeerAddresses.clear();
+
+        if (!newConf.contains(this.nodeId)) {
+            for (Peer peer : peers.values()) {
+                peer.disconnect();
+            }
+            peers.clear();
+        } else {
+            Set<String> peersToRemove = new HashSet<>();
+            for (String peerIdInMap : this.peers.keySet()) {
+                if (!newConf.contains(peerIdInMap) && !peerIdInMap.equals(this.nodeId)) {
+                    peersToRemove.add(peerIdInMap);
+                }
+            }
+            for (String peerToRemove : peersToRemove) {
+                Peer p = this.peers.remove(peerToRemove);
+                if (p != null) {
+                    p.disconnect();
+                    logger.info(nodeId + " disconnected and removed peer " + peerToRemove + " from map as it's not in C_new.");
+                }
+            }
+        }
+    }
+
+    private synchronized void applyCommitedOldNewEntry(LogEntry entry) {
+        if (currentState != NodeState.LEADER) {
+            return;
+        }
+
+        if (this.inJointConsensus) {
+            // send the new entry
+            Set<String> newConf = new HashSet<>(entry.getNewConfList());
+
+            LogEntry newEntry = LogEntry.newBuilder()
+                    .setTerm(currentTerm.get())
+                    .addAllNewConf(newConf)
+                    .setType(LogEntry.LogType.C_NEW)
+                    .build();
+            log.add(newEntry);
+            sendAppendEntries(false);
+        }
+    }
+
+    private synchronized void applyCommitedNewEntry(LogEntry entry) {
+        // this function is only for leader to apply the commited new entry
+        if (currentState != NodeState.LEADER) {
+            return;
+        }
+
+        Set<String> newConf = new HashSet<>(entry.getNewConfList());
+        this.stableConfig = newConf;
+        this.oldConfig = new HashSet<>();
+        this.newConfig = new HashSet<>();
+        this.inJointConsensus = false;
+
+        if (!newConf.contains(this.nodeId)) {
+            for (Peer peer : peers.values()) {
+                peer.disconnect();
+            }
+            peers.clear();
+            becomeFollower(currentTerm.get()); // step down from leadership
+        } else {
+            Set<String> peersToRemove = new HashSet<>();
+            for (String peerIdInMap : this.peers.keySet()) {
+                if (!newConf.contains(peerIdInMap) && !peerIdInMap.equals(this.nodeId)) {
+                    peersToRemove.add(peerIdInMap);
+                }
+            }
+            for (String peerToRemove : peersToRemove) {
+                Peer p = this.peers.remove(peerToRemove);
+                if (p != null) {
+                    p.disconnect();
+                    logger.info(nodeId + " disconnected and removed peer " + peerToRemove);
+                }
+            }
         }
     }
 

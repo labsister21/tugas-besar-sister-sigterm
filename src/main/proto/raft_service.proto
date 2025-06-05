@@ -7,8 +7,24 @@ option java_package = "org.raft.raft.rpc";
 option java_outer_classname = "RaftProto";
 
 message LogEntry {
+  enum LogType {
+    SENTINEL = 0;
+    GET = 1;
+    SET = 2;
+    STRLEN = 3;
+    DEL = 4;
+    APPEND = 5;
+    C_OLD_NEW = 6;
+    C_NEW = 7;
+  }
+
   int64 term = 1;
-  string command = 2;
+  LogType type = 2;
+  optional string key = 3;
+  optional string value = 4;
+  repeated string oldConf = 5;
+  repeated string newConf = 6;
+  repeated string nodeMap = 7;
 }
 
 // RequestVote RPC

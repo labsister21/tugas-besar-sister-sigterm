@@ -23,4 +23,11 @@ public class KVStoreService extends KVStoreServiceGrpc.KVStoreServiceImplBase {
         responseObserver.onNext(response);
         responseObserver.onCompleted();
     }
+
+    @Override
+    public void changeMembership(MemberChangeArgs request, StreamObserver<MemberChangeReply> responseObserver) {
+        MemberChangeReply response = raftNode.handleChangeMembership(request);
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
 }

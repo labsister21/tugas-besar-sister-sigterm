@@ -1,10 +1,6 @@
 package org.raft.client;
 
-import org.raft.kvstore.rpc.ClientRequest;
-import org.raft.kvstore.rpc.ClientResponse;
-import org.raft.kvstore.rpc.KVStoreServiceGrpc;
-import org.raft.kvstore.rpc.RequestLogArgs;
-import org.raft.kvstore.rpc.RequestLogReply;
+import org.raft.kvstore.rpc.*;
 import org.raft.raft.rpc.LogEntry;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -34,7 +30,7 @@ public class Client {
         logger.info("Trying to connect to servery: " + serverAddress);
         try {
             this.channel = ManagedChannelBuilder.forTarget(serverAddress)
-                    .usePlaintext() // Hanya untuk development, gunakan TLS di produksi
+                    .usePlaintext()
                     .build();
             this.blockingStub = KVStoreServiceGrpc.newBlockingStub(channel);
             this.currentServerAddress = serverAddress;
@@ -83,7 +79,7 @@ public class Client {
 
 
         int redirects = 0;
-        String originalCommand = commandString;
+        String rawCommand = commandString;
 
         while (redirects < MAX_REDIRECTS) {
             if (blockingStub == null) {
@@ -93,7 +89,7 @@ public class Client {
             }
 
             try {
-                if (originalCommand.equalsIgnoreCase("REQUEST_LOG")) {
+                if (rawCommand.equalsIgnoreCase("REQUEST_LOG")) {
                     RequestLogArgs logRequest = RequestLogArgs.newBuilder().build();
                     logger.info("Sending REQUEST_LOG to " + currentServerAddress);
                     RequestLogReply logReply = blockingStub.requestLog(logRequest);
@@ -105,7 +101,21 @@ public class Client {
                         } else {
                             for (int i = 0; i < logReply.getLogsCount(); i++) {
                                 LogEntry entry = logReply.getLogs(i);
-                                System.out.println("  Index " + i + ": Term=" + entry.getTerm() + ", Command='" + entry.getCommand() + "'");
+                                System.out.print("  Index " + i + ": Term=" + entry.getTerm());
+                                System.out.print("  Type=" + entry.getType());
+                                if (entry.getKey() != null && !entry.getKey().isEmpty()) {
+                                    System.out.print("  Key=" + entry.getKey());
+                                }
+                                if (entry.getValue() != null && !entry.getValue().isEmpty()) {
+                                    System.out.print("  Value=" + entry.getValue());
+                                }
+                                if (!entry.getOldConfList().isEmpty()) {
+                                    System.out.print("  OldConfList=" + entry.getOldConfList());
+                                }
+                                if (!entry.getNewConfList().isEmpty()) {
+                                    System.out.print("  NewConfList=" + entry.getNewConfList());
+                                }
+                                System.out.println();
                             }
                         }
                         return;
@@ -121,8 +131,43 @@ public class Client {
                             return;
                         }
                     }
+                } else if (rawCommand.startsWith("ADD_MEMBER")) {
+                    String[] res = commandString.split(" ");
+                    String nodeId = res[1];
+                    String nodeAddress = res[2];
+                    MemberChangeArgs request = MemberChangeArgs.newBuilder()
+                            .setType(MemberChangeArgs.ChangeType.ADD)
+                            .setNodeId(nodeId)
+                            .setNodeAddress(nodeAddress)
+                            .build();
+                    try {
+                        MemberChangeReply response = blockingStub.changeMembership(request);
+                        if (response.getSuccess()) {
+                            System.out.println("Member added successfully");
+                        } else {
+                            System.out.println("ERROR: " + response.getErrorMessage());
+                        }
+                    } catch (StatusRuntimeException e) {
+                        System.out.println("ERROR: Failed to add member: " + e.getStatus());
+                    }
+                } else if (rawCommand.startsWith("REMOVE_MEMBER")) {
+                    String[] res = commandString.split(" ");
+                    String nodeId = res[1];
+                    MemberChangeArgs request = MemberChangeArgs.newBuilder()
+                            .setType(MemberChangeArgs.ChangeType.REMOVE)
+                            .setNodeId(nodeId)
+                            .build();
+                    try {
+                        MemberChangeReply response = blockingStub.changeMembership(request);
+                        if (response.getSuccess()) {
+                            System.out.println("Member added successfully");
+                        } else {
+                            System.out.println("ERROR: " + response.getErrorMessage());
+                        }
+                    } catch (StatusRuntimeException e) {
+                        System.out.println("ERROR: Failed to add member: " + e.getStatus());
+                    }
                 } else {
-                    // parse command
                     String[] res = commandString.split(" ");
                     String cmd = res[0];
                     String key = res.length > 1 ? res[1] : null;
@@ -136,7 +181,7 @@ public class Client {
                         builder.setValue(value);
                     }
                     ClientRequest request = builder.build();
-                    logger.info("Sending command '" + originalCommand + "' to " + currentServerAddress);
+                    logger.info("Sending command '" + rawCommand + "' to " + currentServerAddress);
                     ClientResponse response = blockingStub.executeCommand(request);
 
                     if (response.getSuccess()) {
