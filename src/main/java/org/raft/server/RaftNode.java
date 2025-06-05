@@ -171,6 +171,7 @@ public class RaftNode {
     /* TIMER */
     // method to reset election timeout schedule
     private void resetElectionTimer() {
+//        logger.info(nodeId + " reset election timer");
         if (electionTimeoutTask != null && !electionTimeoutTask.isDone()) {
             electionTimeoutTask.cancel(false);
         }
@@ -326,8 +327,6 @@ public class RaftNode {
 
         if (args.getTerm() > currentTerm.get()) {
             becomeFollower(args.getTerm());
-        } else {
-            resetElectionTimer();
         }
 
         // check candidates log up-to-date
@@ -344,6 +343,7 @@ public class RaftNode {
         if ((votedFor == null || votedFor.equals(args.getCandidateId())) && logOk) {
             votedFor = args.getCandidateId();
             voteGranted = true;
+            resetElectionTimer();
             logger.info(nodeId + " voting YES for " + args.getCandidateId() + " for term " + args.getTerm());
         } else {
             logger.info(nodeId + " voting NO for " + args.getCandidateId() + " for term " + args.getTerm() +
@@ -352,21 +352,25 @@ public class RaftNode {
         return RequestVoteReply.newBuilder().setTerm(currentTerm.get()).setVoteGranted(voteGranted).build();
     }
 
-    // send hearbeat from leader
+    // send heartbeat from leader
     private void sendHeartbeats() {
+        logger.fine(nodeId + " sending heartbeats for term " + currentTerm.get());
         synchronized (this) {
             if (currentState != NodeState.LEADER) {
                 return;
             }
             lastLeaderCommunicationTime.set(System.currentTimeMillis());
-            logger.fine(nodeId + " (Leader) sending heartbeats for term " + currentTerm.get());
+            logger.fine(nodeId + " sending heartbeats for term " + currentTerm.get());
             sendAppendEntries(true);
         }
     }
 
     /* APPEND ENTRIES RELATED METHODS */
     // send append entries to multiple peer
-    private void sendAppendEntries(boolean isHeartBeat) {
+    private synchronized void sendAppendEntries(boolean isHeartBeat) {
+        if (isHeartBeat) {
+            logger.info(nodeId + " sends heart beats");
+        }
         for (Peer peer : peers.values()) {
             sendAppendEntries(peer, isHeartBeat);
         }
@@ -374,7 +378,7 @@ public class RaftNode {
 
     // send append entries to a single peer
     private void sendAppendEntries(Peer peer, boolean isHeartBeat) {
-        logger.info(nodeId + " sends append entries to " + peer.getNodeId());
+//        logger.info(nodeId + " sends append entries to " + peer.getNodeId());
         if (currentState != NodeState.LEADER) return;
         final long nextIdx = peer.getNextIndex();
         long prevLogIdx = Math.max(0, nextIdx - 1);
@@ -404,7 +408,7 @@ public class RaftNode {
         CompletableFuture.runAsync(() -> {
             try {
                 if (currentState != NodeState.LEADER) return;
-                AppendEntriesReply reply = peer.getBlockingStub().withDeadlineAfter(5000, TimeUnit.MILLISECONDS).appendEntries(request);
+                AppendEntriesReply reply = peer.getBlockingStub().withDeadlineAfter(ELECTION_TIMEOUT_MAX , TimeUnit.MILLISECONDS).appendEntries(request);
 
                 synchronized (this) {
                     if (reply.getTerm() > currentTerm.get()) {
@@ -441,6 +445,7 @@ public class RaftNode {
 
     // handle append entries respond
     public synchronized AppendEntriesReply handleAppendEntries(AppendEntriesArgs args) {
+        logger.fine(nodeId + " receives append entries from " + args.getLeaderId());
         // early return for old terms
         if (args.getTerm() < currentTerm.get()) {
             return AppendEntriesReply.newBuilder()
@@ -457,10 +462,9 @@ public class RaftNode {
         if (args.getTerm() > currentTerm.get() ||
                 (currentState == NodeState.CANDIDATE && currentTerm.get() == args.getTerm())) {
             becomeFollower(args.getTerm());
-        } else {
-            resetElectionTimer();
         }
 
+        resetElectionTimer();
         // check log consistency
         if (args.getPrevLogIndex() >= log.size() || args.getPrevLogIndex() < 0 ||
                 log.get((int) args.getPrevLogIndex()).getTerm() != args.getPrevLogTerm()) {
@@ -517,6 +521,10 @@ public class RaftNode {
             }
         }
 
+        if (args.getEntriesCount() == 0) {
+            logger.info("Received heart beat");
+        }
+
         return AppendEntriesReply.newBuilder()
                 .setTerm(currentTerm.get())
                 .setSuccess(true)
@@ -534,7 +542,7 @@ public class RaftNode {
                 continue;
             }
 
-            if (checkAknowledgement(newCommitIndex)) {
+            if (checkAcknowledgement(newCommitIndex)) {
                 commitIndex.set(newCommitIndex);
             } else {
                 break;
@@ -548,7 +556,7 @@ public class RaftNode {
     }
 
     // method to check if the majority of nodes has acknowledged this
-    private synchronized boolean checkAknowledgement(long targetLogIndex) {
+    private synchronized boolean checkAcknowledgement(long targetLogIndex) {
         if (currentState != NodeState.LEADER) {
             return false;
         }
@@ -599,6 +607,7 @@ public class RaftNode {
 
     // method to apply commited entries
     private synchronized void applyCommitedEntries() {
+        logger.info(nodeId + " apply committed entries");
         while (lastApplied.get() < commitIndex.get()) {
             long applyIdx = lastApplied.incrementAndGet();
             if (applyIdx >= log.size()) {
@@ -727,6 +736,7 @@ public class RaftNode {
     }
 
     public RequestLogReply handleRequestLog() {
+        logger.info("handle request log");
         synchronized (this) {
             if (currentState != NodeState.LEADER) {
                 String leaderAddr = getPeerAddress(getCurrentLeaderId());
@@ -763,7 +773,7 @@ public class RaftNode {
     }
 
     /* MEMBERSHIP CHANGE RELATED FUNCTIONS */
-    public synchronized MemberChangeReply handleChangeMembership(MemberChangeArgs request) {
+    public MemberChangeReply handleChangeMembership(MemberChangeArgs request) {
         final String type = request.getType().name();
         final String newNodeId = request.getNodeId();
         final String newNodeAddress = request.getNodeAddress();
@@ -839,6 +849,7 @@ public class RaftNode {
     }
 
     private synchronized void applyOldNewEntry(LogEntry entry) {
+        logger.info(nodeId + " is applying c_old_new");
         Set<String> confOld = new HashSet<>(entry.getOldConfList());
         Set<String> confNew = new HashSet<>(entry.getNewConfList());
 
@@ -879,6 +890,7 @@ public class RaftNode {
     }
 
     private synchronized void applyNewEntry(LogEntry entry) {
+        logger.info(nodeId + " is applying c_new");
         Set<String> newConf = new HashSet<>(entry.getNewConfList());
         this.stableConfig = newConf;
         this.oldConfig = new HashSet<>();
@@ -912,6 +924,7 @@ public class RaftNode {
         if (currentState != NodeState.LEADER) {
             return;
         }
+        logger.info(nodeId + " is committing c_old_new");
 
         if (this.inJointConsensus) {
             // send the new entry
@@ -932,6 +945,7 @@ public class RaftNode {
         if (currentState != NodeState.LEADER) {
             return;
         }
+        logger.info(nodeId + " is committing c_new");
 
         Set<String> newConf = new HashSet<>(entry.getNewConfList());
         this.stableConfig = newConf;
