@@ -7,6 +7,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class RaftNode {
@@ -74,6 +75,8 @@ public class RaftNode {
                 }
             }
     );
+
+    private static final long APPEND_ENTRIES_RETRY_DELAY_MS = 100;
 
     // state for membership change
     private volatile Set<String> stableConfig;
@@ -369,78 +372,200 @@ public class RaftNode {
     // send append entries to multiple peer
     private synchronized void sendAppendEntries(boolean isHeartBeat) {
         if (isHeartBeat) {
-            logger.info(nodeId + " sends heart beats");
+//            logger.info(nodeId + " sends heart beats");
         }
         for (Peer peer : peers.values()) {
             sendAppendEntries(peer, isHeartBeat);
         }
     }
 
-    // send append entries to a single peer
     private void sendAppendEntries(Peer peer, boolean isHeartBeat) {
-//        logger.info(nodeId + " sends append entries to " + peer.getNodeId());
+        final String peerId = peer.getNodeId();
         if (!isHeartBeat) {
-            logger.info(nodeId + " send append entries to " + peer.getNodeId());
+            logger.info(nodeId + " Preparing to send append entries to " + peer.getNodeId());
         }
         if (currentState != NodeState.LEADER) return;
-        final long nextIdx = peer.getNextIndex();
-        long prevLogIdx = Math.max(0, nextIdx - 1);
 
-        if (prevLogIdx >= log.size()) {
-            peer.setNextIndex(log.size());
-            prevLogIdx = Math.max(0, peer.getNextIndex() - 1);
+        final long currentTermSnapshot = currentTerm.get();
+
+        final long nextIdxToSendFromPeerObject = peer.getNextIndex();
+        long prevLogIdxForThisRpc = Math.max(0, nextIdxToSendFromPeerObject - 1);
+        int currentLeaderLogSize = log.size();
+
+        if (nextIdxToSendFromPeerObject > currentLeaderLogSize) {
+            logger.warning(nodeId + " nextIndex " + nextIdxToSendFromPeerObject + " for peer " + peerId +
+                    " is beyond current leader log size " + currentLeaderLogSize +
+                    ". Constructing this AE to send from end of current leader log.");
+            prevLogIdxForThisRpc = Math.max(0, currentLeaderLogSize - 1);
+        } else if (prevLogIdxForThisRpc >= currentLeaderLogSize) { // Should be caught by above, but as safeguard
+            logger.warning(nodeId + " Calculated prevLogIdx " + prevLogIdxForThisRpc + " for peer " + peerId +
+                    " is out of bounds (leader log size: " + currentLeaderLogSize +
+                    "). Adjusting to send from end of current leader log.");
+            prevLogIdxForThisRpc = Math.max(0, currentLeaderLogSize - 1);
         }
 
-        long prevLogTerm = log.get((int) prevLogIdx).getTerm();
+        long prevLogTermValForThisRpc;
+        if (currentLeaderLogSize == 0) {
+            prevLogTermValForThisRpc = 0;
+        } else {
+            prevLogTermValForThisRpc = log.get((int) prevLogIdxForThisRpc).getTerm();
+        }
+
         AppendEntriesArgs.Builder builder = AppendEntriesArgs.newBuilder().
-                setTerm(currentTerm.get()).
+                setTerm(currentTermSnapshot).
                 setLeaderId(nodeId).
-                setPrevLogIndex(prevLogIdx).
-                setPrevLogTerm(prevLogTerm).
+                setPrevLogIndex(prevLogIdxForThisRpc).
+                setPrevLogTerm(prevLogTermValForThisRpc).
                 setLeaderCommit(commitIndex.get());
 
-        List<LogEntry> entries = new ArrayList<>();
+        List<LogEntry> entriesToSend = new ArrayList<>();
         if (!isHeartBeat) {
-            for (int i = (int) prevLogIdx + 1; i < log.size(); i++) {
-                entries.add(log.get(i));
+            long effectiveStartIndex = nextIdxToSendFromPeerObject;
+            if (nextIdxToSendFromPeerObject > currentLeaderLogSize) {
+                effectiveStartIndex = currentLeaderLogSize;
+            }
+
+
+            for (long i = effectiveStartIndex; i < currentLeaderLogSize; i++) {
+                if (i >= 0 && i < log.size()) {
+                    entriesToSend.add(log.get((int) i));
+                } else {
+                    logger.warning(nodeId + " Index " + i + " out of bounds during entriesToSend construction for " + peerId +
+                            ". Log size: " + log.size() + ". Breaking.");
+                    break;
+                }
             }
         }
-        builder.addAllEntries(entries);
+
+        builder.addAllEntries(entriesToSend);
         AppendEntriesArgs request = builder.build();
+
+        if (!isHeartBeat || !entriesToSend.isEmpty()) {
+            logger.info(nodeId + " Sending AE to " + peer.getNodeId() + ". Term: " + request.getTerm() +
+                    ", PrevLogIdx: " + request.getPrevLogIndex() + ", PrevLogTerm: " + request.getPrevLogTerm() +
+                    ", EntriesCount: " + request.getEntriesCount() + ", isHeartbeat: " + isHeartBeat +
+                    ", PeerNextIndexAtSendTime: " + nextIdxToSendFromPeerObject); // Log what nextIndex was when we built this
+        }
+
 
         CompletableFuture.runAsync(() -> {
             try {
-                if (currentState != NodeState.LEADER) return;
-                AppendEntriesReply reply = peer.getBlockingStub().withDeadlineAfter(ELECTION_TIMEOUT_MAX, TimeUnit.MILLISECONDS).appendEntries(request);
+                if (currentState != NodeState.LEADER || currentTerm.get() != currentTermSnapshot) {
+                    logger.fine(nodeId + " AE to " + peer.getNodeId() + " aborted before RPC: No longer leader or term changed.");
+                    return;
+                }
+
+                AppendEntriesReply reply = peer.getBlockingStub()
+                        .withDeadlineAfter(ELECTION_TIMEOUT_MAX, TimeUnit.MILLISECONDS) // ELECTION_TIMEOUT_MAX might be too long for an RPC
+                        .appendEntries(request);
 
                 synchronized (this) {
+                    if (currentState != NodeState.LEADER || currentTerm.get() != currentTermSnapshot) {
+                        logger.info(nodeId + " Leader state/term changed while AE RPC to " + peer.getNodeId() + " was in flight. Ignoring reply.");
+                        return;
+                    }
+
                     if (reply.getTerm() > currentTerm.get()) {
+                        logger.info(nodeId + " Peer " + peer.getNodeId() + " replied with newer term " + reply.getTerm() + ". Becoming follower.");
                         becomeFollower(reply.getTerm());
                         return;
                     }
 
-                    if (reply.getTerm() == currentTerm.get() && currentState == NodeState.LEADER) {
+                    if (reply.getTerm() == currentTerm.get()) {
                         if (reply.getSuccess()) {
-                            long newMatchIndex = request.getPrevLogIndex() + request.getEntriesCount();
-                            long newNextIndex = newMatchIndex + 1;
-                            peer.setNodeMatchIndex(newMatchIndex);
-                            peer.setNextIndex(newNextIndex);
+                            long matchIndexFromThisRpc = request.getPrevLogIndex() + request.getEntriesCount();
+                            long nextIndexFromThisRpc = matchIndexFromThisRpc + 1;
 
-                            // update commit index
+                            if (matchIndexFromThisRpc > peer.getNodeMatchIndex()) {
+                                peer.setNodeMatchIndex(matchIndexFromThisRpc);
+                            }
+                            if (nextIndexFromThisRpc > peer.getNextIndex()) {
+                                peer.setNextIndex(nextIndexFromThisRpc);
+                            }
+
+                            logger.fine(nodeId + " AE success from " + peer.getNodeId() +
+                                    ". PeerMatchIndex now: " + peer.getNodeMatchIndex() +
+                                    ", PeerNextIndex now: " + peer.getNextIndex());
                             updateCommitIndex();
                         } else if (!isHeartBeat) {
-                            long newNextIdx = Math.max(1, peer.getNextIndex() - 1);
-                            peer.setNextIndex(newNextIdx);
-                            sendAppendEntries(peer, false);
+                            long currentNextIndexOnPeerObject = peer.getNextIndex();
+                            long newBackedOffNextIdx;
+
+                            if (reply.getMatchIndex() < request.getPrevLogIndex() && reply.getMatchIndex() >= 0) {
+                                newBackedOffNextIdx = reply.getMatchIndex() + 1;
+                            } else {
+                                newBackedOffNextIdx = Math.max(1, currentNextIndexOnPeerObject - 1);
+                            }
+                            newBackedOffNextIdx = Math.min(newBackedOffNextIdx, currentNextIndexOnPeerObject);
+
+
+                            logger.info(nodeId + " AE to " + peer.getNodeId() + " failed (log inconsistency). " +
+                                    "FollowerMatchHint: " + reply.getMatchIndex() +
+                                    ". Peer's current nextIndex: " + currentNextIndexOnPeerObject +
+                                    ". Backing off PeerNextIndex to " + newBackedOffNextIdx);
+
+                            peer.setNextIndex(newBackedOffNextIdx);
+
+                            logger.info(nodeId + " Scheduling retry AE (log sync) to " + peer.getNodeId() + " in " + APPEND_ENTRIES_RETRY_DELAY_MS + "ms.");
+                            scheduler.schedule(() -> {
+                                if (RaftNode.this.currentState == NodeState.LEADER && RaftNode.this.currentTerm.get() == currentTermSnapshot) {
+                                    sendAppendEntries(peer, false);
+                                } else {
+                                    logger.info(nodeId + " Retry AE for " + peer.getNodeId() + " cancelled; state/term changed during delay.");
+                                }
+                            }, APPEND_ENTRIES_RETRY_DELAY_MS, TimeUnit.MILLISECONDS);
                         }
                     }
                 }
+            } catch (io.grpc.StatusRuntimeException sre) {
+                logger.warning(nodeId + " gRPC Exception sending AE to " + peer.getNodeId() +
+                        " (isHeartbeat: " + isHeartBeat + ", SentPrevLogIdx: " + request.getPrevLogIndex() +
+                        ", PeerNextIndexAtSendTime: " + nextIdxToSendFromPeerObject +
+                        "). Status: " + sre.getStatus().getCode() + " - " + sre.getStatus().getDescription());
+                if (!isHeartBeat && currentState == NodeState.LEADER && currentTerm.get() == currentTermSnapshot) {
+                    synchronized (this) {
+                        if (currentState == NodeState.LEADER && currentTerm.get() == currentTermSnapshot) {
+                            long nextIdxToBackOffFrom = peer.getNextIndex();
+                            if (nextIdxToBackOffFrom == nextIdxToSendFromPeerObject && request.getPrevLogIndex() + 1 != nextIdxToSendFromPeerObject && request.getEntriesCount() > 0){
+                                nextIdxToBackOffFrom = nextIdxToSendFromPeerObject;
+                            }
 
+                            long newBackedOffNextIdx = Math.max(1, nextIdxToBackOffFrom - 1);
+                            if (newBackedOffNextIdx < peer.getNextIndex() || (peer.getNextIndex() == 1 && newBackedOffNextIdx == 1) ){
+                                peer.setNextIndex(newBackedOffNextIdx);
+                                logger.info(nodeId + " AE to " + peer.getNodeId() + " failed (gRPC exception). " +
+                                        "Backed off PeerNextIndex to " + peer.getNextIndex() +
+                                        " (was " + nextIdxToSendFromPeerObject + " at send time). Will retry on next cycle.");
+                            } else {
+                                logger.info(nodeId + " AE to " + peer.getNodeId() + " failed (gRPC exception). " +
+                                        "PeerNextIndex ("+ peer.getNextIndex() +") not backed off further. Will retry on next cycle.");
+                            }
+                        }
+                    }
+                }
             } catch (Exception e) {
-                if (!isHeartBeat && currentState == NodeState.LEADER) {
-                    long newNextIdx = Math.max(1, peer.getNextIndex() - 1);
-                    peer.setNextIndex(newNextIdx);
-                    sendAppendEntries(peer, false);
+                logger.log(Level.SEVERE, nodeId + " Generic Exception sending AE to " + peer.getNodeId() +
+                        " (isHeartbeat: " + isHeartBeat + ", SentPrevLogIdx: " + request.getPrevLogIndex() +
+                        ", PeerNextIndexAtSendTime: " + nextIdxToSendFromPeerObject + ")", e);
+                if (!isHeartBeat && currentState == NodeState.LEADER && currentTerm.get() == currentTermSnapshot) {
+                    synchronized (this) {
+                        if (currentState == NodeState.LEADER && currentTerm.get() == currentTermSnapshot) {
+                            long nextIdxToBackOffFrom = peer.getNextIndex();
+                            if (nextIdxToBackOffFrom == nextIdxToSendFromPeerObject && request.getPrevLogIndex() +1 != nextIdxToSendFromPeerObject && request.getEntriesCount() > 0){
+                                nextIdxToBackOffFrom = nextIdxToSendFromPeerObject;
+                            }
+                            long newBackedOffNextIdx = Math.max(1, nextIdxToBackOffFrom - 1);
+                            if (newBackedOffNextIdx < peer.getNextIndex() || (peer.getNextIndex() == 1 && newBackedOffNextIdx ==1) ){
+                                peer.setNextIndex(newBackedOffNextIdx);
+                                logger.info(nodeId + " AE to " + peer.getNodeId() + " failed (generic exception). " +
+                                        "Backed off PeerNextIndex to " + peer.getNextIndex() +
+                                        " (was " + nextIdxToSendFromPeerObject + " at send time). Will retry on next cycle.");
+                            } else {
+                                logger.info(nodeId + " AE to " + peer.getNodeId() + " failed (generic exception). " +
+                                        "PeerNextIndex ("+ peer.getNextIndex() +") not backed off further. Will retry on next cycle.");
+                            }
+                        }
+                    }
                 }
             }
         }, appendEntriesRpcExecutor);
@@ -448,9 +573,49 @@ public class RaftNode {
 
     // handle append entries respond
     public synchronized AppendEntriesReply handleAppendEntries(AppendEntriesArgs args) {
-        logger.fine(nodeId + " receives append entries from " + args.getLeaderId());
-        // early return for old terms
         if (args.getTerm() < currentTerm.get()) {
+            logger.warning(nodeId + " [handleAppendEntries] Rejected AE from " + args.getLeaderId() +
+                    ": Older term " + args.getTerm() + " (my term: " + currentTerm.get() + ")");
+            return AppendEntriesReply.newBuilder()
+                    .setTerm(currentTerm.get())
+                    .setSuccess(false)
+                    .setMatchIndex(!this.log.isEmpty() ? this.log.size() - 1 : 0) // Hint: my last log index
+                    .build();
+        }
+
+        lastLeaderCommunicationTime.set(System.currentTimeMillis());
+        currentLeaderId = args.getLeaderId();
+
+        if (args.getTerm() > currentTerm.get()) {
+            logger.info(nodeId + " [handleAppendEntries] Received AE from " + args.getLeaderId() +
+                    " with newer term " + args.getTerm() + ". Becoming follower.");
+            becomeFollower(args.getTerm());
+        } else if (currentState == NodeState.CANDIDATE && args.getTerm() == currentTerm.get()) {
+            logger.info(nodeId + " [handleAppendEntries] Candidate received AE from leader " + args.getLeaderId() +
+                    " in same term " + args.getTerm() + ". Becoming follower.");
+            becomeFollower(args.getTerm());
+        } else {
+            if (currentState == NodeState.LEADER && !this.nodeId.equals(args.getLeaderId())) {
+                logger.warning(nodeId + " [handleAppendEntries] Leader received AE from another leader " + args.getLeaderId() +
+                        " in same term " + args.getTerm() + ". Stepping down.");
+                becomeFollower(args.getTerm());
+            } else {
+                resetElectionTimer();
+            }
+        }
+
+        if (args.getPrevLogIndex() >= log.size()) {
+            logger.warning(nodeId + " [handleAppendEntries] Rejected AE from " + args.getLeaderId() +
+                    ": prevLogIndex " + args.getPrevLogIndex() + " is out of bounds (my log size: " + log.size() + ").");
+            return AppendEntriesReply.newBuilder()
+                    .setTerm(currentTerm.get())
+                    .setSuccess(false)
+                    .setMatchIndex(this.log.size() > 0 ? this.log.size() - 1 : 0) // Hint: my current last log index
+                    .build();
+        }
+        if (args.getPrevLogIndex() < 0) {
+            logger.severe(nodeId + " [handleAppendEntries] Rejected AE from " + args.getLeaderId() +
+                    ": prevLogIndex " + args.getPrevLogIndex() + " is negative. This is unexpected.");
             return AppendEntriesReply.newBuilder()
                     .setTerm(currentTerm.get())
                     .setSuccess(false)
@@ -458,32 +623,28 @@ public class RaftNode {
                     .build();
         }
 
-        // valid append entries received
-        lastLeaderCommunicationTime.set(System.currentTimeMillis());
-        currentLeaderId = args.getLeaderId();
-
-        if (args.getTerm() > currentTerm.get() ||
-                currentState == NodeState.CANDIDATE) {
-            becomeFollower(args.getTerm());
-        } else {
-            resetElectionTimer();
-        }
-        // check log consistency
-        if (args.getPrevLogIndex() >= log.size() || args.getPrevLogIndex() < 0 ||
-                log.get((int) args.getPrevLogIndex()).getTerm() != args.getPrevLogTerm()) {
+        if (log.get((int) args.getPrevLogIndex()).getTerm() != args.getPrevLogTerm()) {
+            logger.warning(nodeId + " [handleAppendEntries] Rejected AE from " + args.getLeaderId() +
+                    ": Term mismatch at prevLogIndex " + args.getPrevLogIndex() +
+                    ". My term: " + log.get((int) args.getPrevLogIndex()).getTerm() +
+                    ", Leader's prevLogTerm: " + args.getPrevLogTerm());
+            long hintMatchIndex = Math.max(0, args.getPrevLogIndex() - 1);
             return AppendEntriesReply.newBuilder()
                     .setTerm(currentTerm.get())
                     .setSuccess(false)
-                    .setMatchIndex(0)
+                    .setMatchIndex(hintMatchIndex)
                     .build();
         }
 
         int conflictIndex = -1;
         for (int i = 0; i < args.getEntriesCount(); i++) {
-            int logIndex = (int) args.getPrevLogIndex() + 1 + i;
-            if (logIndex < log.size()) {
-                if (log.get(logIndex).getTerm() != args.getEntries(i).getTerm()) {
-                    conflictIndex = logIndex;
+            int logIndexOnFollower = (int) args.getPrevLogIndex() + 1 + i;
+            if (logIndexOnFollower < log.size()) {
+                if (log.get(logIndexOnFollower).getTerm() != args.getEntries(i).getTerm()) {
+                    conflictIndex = logIndexOnFollower;
+                    logger.info(nodeId + " [handleAppendEntries] Conflict detected at index " + conflictIndex +
+                            ". My term: " + log.get(conflictIndex).getTerm() +
+                            ", Leader's entry term: " + args.getEntries(i).getTerm() + ". Truncating log.");
                     break;
                 }
             } else {
@@ -491,43 +652,76 @@ public class RaftNode {
             }
         }
 
-        // delete conflicting entries and everything after
         if (conflictIndex != -1) {
             while (log.size() > conflictIndex) {
                 log.removeLast();
             }
+            logger.info(nodeId + " [handleAppendEntries] Log truncated due to conflict. New size: " + log.size());
         }
 
-        // only append new entries that aren't already in log
-        int startAppendIndex = Math.max(0, (int) args.getPrevLogIndex() + 1 - log.size());
-        for (int i = startAppendIndex; i < args.getEntriesCount(); i++) {
-            log.add(args.getEntries(i));
-        }
-
-        // check if there's a configuration change entry
-        for (int i = startAppendIndex; i < args.getEntriesCount(); i++) {
-            LogEntry l = args.getEntries(i);
-            if (l.getType().equals(LogEntry.LogType.C_OLD_NEW)) {
-                applyOldNewEntry(l);
+        int followerLogPositionForNewEntries = (int) args.getPrevLogIndex() + 1;
+        int entriesActuallyAppended = 0;
+        for (int i = 0; i < args.getEntriesCount(); i++) {
+            LogEntry leaderEntry = args.getEntries(i);
+            if (followerLogPositionForNewEntries < log.size()) {
+                if (log.get(followerLogPositionForNewEntries).getTerm() == leaderEntry.getTerm()) {
+                    followerLogPositionForNewEntries++;
+                } else {
+                    logger.warning(nodeId + " [handleAppendEntries] Unexpected new conflict at index " + followerLogPositionForNewEntries +
+                            " during append phase. My term: " + log.get(followerLogPositionForNewEntries).getTerm() +
+                            ", Leader's entry term: " + leaderEntry.getTerm() + ". Truncating again from here.");
+                    while (log.size() > followerLogPositionForNewEntries) {
+                        log.removeLast();
+                    }
+                    log.add(leaderEntry);
+                    entriesActuallyAppended++;
+                    followerLogPositionForNewEntries++;
+                }
+            } else {
+                log.add(leaderEntry);
+                entriesActuallyAppended++;
+                followerLogPositionForNewEntries++;
             }
-            if (l.getType().equals(LogEntry.LogType.C_NEW)) {
-                applyNewEntry(l);
+        }
+
+        if (entriesActuallyAppended > 0) {
+            logger.info(nodeId + " [handleAppendEntries] Appended " + entriesActuallyAppended + " new entries. Log size now: " + log.size());
+        }
+
+        int configScanStartIndex = (int) args.getPrevLogIndex() + 1;
+        for (int i = configScanStartIndex; i < log.size(); i++) {
+            int entryIndexInArgs = i - ((int) args.getPrevLogIndex() + 1);
+            if (entryIndexInArgs >= 0 && entryIndexInArgs < args.getEntriesCount()) {
+                LogEntry currentLogEntry = log.get(i);
+                if (currentLogEntry.getType().equals(LogEntry.LogType.C_OLD_NEW)) {
+                    logger.info(nodeId + " [handleAppendEntries] Applying C_OLD_NEW config from log at index " + i);
+                    applyOldNewEntry(currentLogEntry);
+                }
+                if (currentLogEntry.getType().equals(LogEntry.LogType.C_NEW)) {
+                    logger.info(nodeId + " [handleAppendEntries] Applying C_NEW config from log at index " + i);
+                    applyNewEntry(currentLogEntry);
+                }
             }
         }
 
-        // update commit
+
         if (args.getLeaderCommit() > commitIndex.get()) {
-            long newCommitIndex = Math.min(args.getLeaderCommit(), log.size() - 1);
-            if (newCommitIndex > commitIndex.get()) {
-                commitIndex.set(newCommitIndex);
+            long newFollowerCommitIndex = Math.min(args.getLeaderCommit(), log.size() - 1);
+            if (newFollowerCommitIndex < 0) newFollowerCommitIndex = 0;
+
+            if (newFollowerCommitIndex > commitIndex.get()) {
+                logger.info(nodeId + " [handleAppendEntries] Updating commitIndex from " + commitIndex.get() + " to " + newFollowerCommitIndex);
+                commitIndex.set(newFollowerCommitIndex);
                 applyCommitedEntries();
             }
         }
 
-        if (args.getEntriesCount() == 0) {
-            logger.info("Received heart beat");
-        } else {
-            logger.info("Received append entries");
+        if (args.getEntriesCount() == 0 && entriesActuallyAppended == 0) {
+            logger.fine(nodeId + " [handleAppendEntries] Processed heartbeat from " + args.getLeaderId() + ". My log size: " + log.size());
+        } else if (entriesActuallyAppended > 0 || args.getEntriesCount() > 0) { // Log if any entries were processed or received
+            logger.info(nodeId + " [handleAppendEntries] Processed append entries from " + args.getLeaderId() +
+                    ". Entries in RPC: " + args.getEntriesCount() + ", Entries appended: " + entriesActuallyAppended +
+                    ". My log size: " + log.size());
         }
 
         return AppendEntriesReply.newBuilder()
@@ -651,7 +845,7 @@ public class RaftNode {
                     }
                 }
                 case "SET" -> {
-                    if (key != null && value != null && !key.isEmpty() && !value.isEmpty()) {
+                    if (key != null && value != null && !key.isEmpty()) {
                         keyValueStore.put(key, value);
                         yield "OK";
                     }
@@ -672,7 +866,7 @@ public class RaftNode {
                     yield "ERROR: Missing key for DEL";
                 }
                 case "APPEND" -> {
-                    if (key != null && value != null && !key.isEmpty() && !value.isEmpty()) {
+                    if (key != null && value != null && !key.isEmpty()) {
                         keyValueStore.compute(key, (k, v) -> (v == null) ? value : v + value);
                         yield "OK";
                     }

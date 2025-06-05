@@ -161,7 +161,7 @@ public class Client {
                     try {
                         MemberChangeReply response = blockingStub.changeMembership(request);
                         if (response.getSuccess()) {
-                            System.out.println("Member added successfully");
+                            System.out.println("Member removed successfully");
                         } else {
                             System.out.println("ERROR: " + response.getErrorMessage());
                         }
