@@ -380,73 +380,33 @@ public class RaftNode {
     }
 
     private void sendAppendEntries(Peer peer, boolean isHeartBeat) {
-        final String peerId = peer.getNodeId();
-        if (!isHeartBeat) {
-            logger.info(nodeId + " Preparing to send append entries to " + peer.getNodeId());
-        }
         if (currentState != NodeState.LEADER) return;
-
+        final long nextIdx = peer.getNextIndex();
         final long currentTermSnapshot = currentTerm.get();
+        final long currLogSize = log.size();
+        long prevLogIdx = Math.max(0, nextIdx - 1);
 
-        final long nextIdxToSendFromPeerObject = peer.getNextIndex();
-        long prevLogIdxForThisRpc = Math.max(0, nextIdxToSendFromPeerObject - 1);
-        int currentLeaderLogSize = log.size();
-
-        if (nextIdxToSendFromPeerObject > currentLeaderLogSize) {
-            logger.warning(nodeId + " nextIndex " + nextIdxToSendFromPeerObject + " for peer " + peerId +
-                    " is beyond current leader log size " + currentLeaderLogSize +
-                    ". Constructing this AE to send from end of current leader log.");
-            prevLogIdxForThisRpc = Math.max(0, currentLeaderLogSize - 1);
-        } else if (prevLogIdxForThisRpc >= currentLeaderLogSize) { // Should be caught by above, but as safeguard
-            logger.warning(nodeId + " Calculated prevLogIdx " + prevLogIdxForThisRpc + " for peer " + peerId +
-                    " is out of bounds (leader log size: " + currentLeaderLogSize +
-                    "). Adjusting to send from end of current leader log.");
-            prevLogIdxForThisRpc = Math.max(0, currentLeaderLogSize - 1);
+        if (prevLogIdx >= currLogSize) {
+            peer.setNextIndex(currLogSize);
+            prevLogIdx = Math.max(0, currLogSize - 1);
         }
 
-        long prevLogTermValForThisRpc;
-        if (currentLeaderLogSize == 0) {
-            prevLogTermValForThisRpc = 0;
-        } else {
-            prevLogTermValForThisRpc = log.get((int) prevLogIdxForThisRpc).getTerm();
-        }
-
+        long prevLogTerm = log.get((int) prevLogIdx).getTerm();
         AppendEntriesArgs.Builder builder = AppendEntriesArgs.newBuilder().
-                setTerm(currentTermSnapshot).
+                setTerm(currentTerm.get()).
                 setLeaderId(nodeId).
-                setPrevLogIndex(prevLogIdxForThisRpc).
-                setPrevLogTerm(prevLogTermValForThisRpc).
+                setPrevLogIndex(prevLogIdx).
+                setPrevLogTerm(prevLogTerm).
                 setLeaderCommit(commitIndex.get());
 
-        List<LogEntry> entriesToSend = new ArrayList<>();
+        List<LogEntry> entries = new ArrayList<>();
         if (!isHeartBeat) {
-            long effectiveStartIndex = nextIdxToSendFromPeerObject;
-            if (nextIdxToSendFromPeerObject > currentLeaderLogSize) {
-                effectiveStartIndex = currentLeaderLogSize;
-            }
-
-
-            for (long i = effectiveStartIndex; i < currentLeaderLogSize; i++) {
-                if (i >= 0 && i < log.size()) {
-                    entriesToSend.add(log.get((int) i));
-                } else {
-                    logger.warning(nodeId + " Index " + i + " out of bounds during entriesToSend construction for " + peerId +
-                            ". Log size: " + log.size() + ". Breaking.");
-                    break;
-                }
+            for (int i = (int) prevLogIdx + 1; i < log.size(); i++) {
+                entries.add(log.get(i));
             }
         }
-
-        builder.addAllEntries(entriesToSend);
+        builder.addAllEntries(entries);
         AppendEntriesArgs request = builder.build();
-
-        if (!isHeartBeat || !entriesToSend.isEmpty()) {
-            logger.info(nodeId + " Sending AE to " + peer.getNodeId() + ". Term: " + request.getTerm() +
-                    ", PrevLogIdx: " + request.getPrevLogIndex() + ", PrevLogTerm: " + request.getPrevLogTerm() +
-                    ", EntriesCount: " + request.getEntriesCount() + ", isHeartbeat: " + isHeartBeat +
-                    ", PeerNextIndexAtSendTime: " + nextIdxToSendFromPeerObject); // Log what nextIndex was when we built this
-        }
-
 
         CompletableFuture.runAsync(() -> {
             try {
@@ -456,7 +416,7 @@ public class RaftNode {
                 }
 
                 AppendEntriesReply reply = peer.getBlockingStub()
-                        .withDeadlineAfter(ELECTION_TIMEOUT_MAX, TimeUnit.MILLISECONDS) // ELECTION_TIMEOUT_MAX might be too long for an RPC
+                        .withDeadlineAfter(ELECTION_TIMEOUT_MAX, TimeUnit.MILLISECONDS)
                         .appendEntries(request);
 
                 synchronized (this) {
@@ -503,9 +463,6 @@ public class RaftNode {
                     }
                 }
             } catch (Exception e) {
-                logger.log(Level.SEVERE, nodeId + " Generic Exception sending AE to " + peer.getNodeId() +
-                        " (isHeartbeat: " + isHeartBeat + ", SentPrevLogIdx: " + request.getPrevLogIndex() +
-                        ", PeerNextIndexAtSendTime: " + nextIdxToSendFromPeerObject + ")", e);
                 if (!isHeartBeat && currentState == NodeState.LEADER && currentTerm.get() == currentTermSnapshot) {
                     long newNextIdx = Math.max(1, peer.getNextIndex() - 1);
                     peer.setNextIndex(newNextIdx);
